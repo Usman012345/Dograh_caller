@@ -1,0 +1,18 @@
+[Unit]
+Description=Lead streamer (hands scraper leads to the dograh caller)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lead_streamer
+ExecStart=/opt/lead_streamer/.venv/bin/python lead_streamer.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=25
+MemoryMax=300M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
