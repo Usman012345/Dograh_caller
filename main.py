@@ -41,7 +41,7 @@ from pipeline import run_leads_sync
 # Relative paths are relative to this folder. None = no file (use INPUT_LEADS).
 # Left empty on purpose: every run is LIVE, so the program only calls leads you
 # point it at. Don't use examples/sample_leads.xlsx here - its numbers are fictional.
-INPUT_FILE_PATH: Optional[str] = None
+INPUT_FILE_PATH: Optional[str] = r"C:\Users\adil.zia\Desktop\Tasks\Task10\dograh_caller\examples\datapoints.xlsx"
 
 # Worksheet to read from INPUT_FILE_PATH (None = first sheet).
 INPUT_SHEET: Optional[str] = None
