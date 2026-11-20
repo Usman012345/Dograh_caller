@@ -28,6 +28,7 @@ Queues live in memory only: if the process stops, leads still in flight are lost
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -36,9 +37,9 @@ from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Union
 import config
 from campaign_manager import CampaignJob, CampaignLead
 from decision_maker import Decision, DecisionMaker, Service, load_services
-from dograh_client import Agent, CallOutcome, DograhClient
+from dograh_client import Agent, CallOutcome, DograhClient, is_transferred
 from number_verifier import NumberVerifier, Verification, load_called_numbers
-from results_store import FIXED_COLUMNS, ResultsStore
+from results_store import TRANSFER_COLUMNS, TRANSFERS_SHEET_NAME, ResultsStore, transfer_row
 
 _STOP_TIMEOUT = 5
 
@@ -93,7 +94,8 @@ class LeadPipeline:
         self._flush_lock = asyncio.Lock()
         self._live_campaigns: Dict[int, str] = {}       # campaign id -> name, started and not yet stopped
         self._lead_counter = 0
-        self._tasks: List[asyncio.Task] = []
+        self._stage_tasks: List[asyncio.Task] = []
+        self._writer_task: Optional[asyncio.Task] = None
         self._started = False
 
     # ------------------------------------------------------------------ lifecycle
@@ -102,10 +104,17 @@ class LeadPipeline:
         if self._started:
             return
         self.services = load_services(self.services_file)
-        already_called = load_called_numbers(self.results_file) if config.SKIP_ALREADY_CALLED else set()
+        already_called = (
+            await asyncio.to_thread(load_called_numbers, self.results_file)
+            if config.SKIP_ALREADY_CALLED else set()
+        )
         self.verifier = NumberVerifier(already_called=already_called)
         self.decider = DecisionMaker(self.services, self.threshold, config.JEV_API_KEY, config.JEV_MODEL)
-        self.store = ResultsStore(self.results_file)
+        self.store = await asyncio.to_thread(ResultsStore, self.results_file)
+        # Only businesses whose call was transferred; the file is created on the first transfer
+        self.transfers = await asyncio.to_thread(
+            lambda: ResultsStore(config.TRANSFERS_FILE, fixed_columns=TRANSFER_COLUMNS,
+                                 sheet_name=TRANSFERS_SHEET_NAME, time_column="transferred_at"))
         self.dograh = DograhClient()
         self.agents: Dict[str, Agent] = {}
         # Campaign names use the date the run started ("Draftliner_<start date>")
@@ -125,10 +134,10 @@ class LeadPipeline:
         log("setup", f"Results file: {self.results_file}")
         print("-" * 100, flush=True)
 
-        self._tasks.append(asyncio.create_task(self._verifier_worker()))
+        self._stage_tasks.append(asyncio.create_task(self._verifier_worker()))
         for _ in range(max(1, config.DECISION_CONCURRENCY)):
-            self._tasks.append(asyncio.create_task(self._decision_worker()))
-        self._tasks.append(asyncio.create_task(self._writer_worker()))
+            self._stage_tasks.append(asyncio.create_task(self._decision_worker()))
+        self._writer_task = asyncio.create_task(self._writer_worker())
         self._started = True
 
     async def submit(self, lead: Dict[str, Any]) -> None:
@@ -159,7 +168,8 @@ class LeadPipeline:
     async def close(self, abort: bool = False) -> None:
         """
         Process every submitted lead (including all calls), then shut down.
-        With abort=True (Ctrl+C or an error) nothing more is processed.
+        With abort=True (Ctrl+C or an error) nothing more is processed, though
+        already-queued results are flushed to disk before exiting.
         Either way, every campaign this run started is stopped before exiting.
         """
         if not self._started:
@@ -167,17 +177,33 @@ class LeadPipeline:
         try:
             if not abort:
                 await self.flush()
-                await self._results_q.join()
         finally:
-            for t in self._tasks:
-                t.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-            self._stop_live_campaigns()
-            await self._final_save()
-            await self.decider.close()
-            self.dograh.close()
-            self._started = False
-            self._print_summary()
+            try:
+                for t in self._stage_tasks:
+                    t.cancel()
+                if self._stage_tasks:
+                    await asyncio.gather(*self._stage_tasks, return_exceptions=True)
+                self._stage_tasks.clear()
+
+                if self._writer_task is not None and not self._writer_task.done():
+                    try:
+                        await self._results_q.join()
+                    except BaseException:
+                        pass
+                    self._writer_task.cancel()
+                    await asyncio.gather(self._writer_task, return_exceptions=True)
+                self._writer_task = None
+            finally:
+                self._stop_live_campaigns()
+                for store in (self.store, self.transfers):
+                    try:
+                        await self._final_save(store)
+                    except BaseException:
+                        store.save()
+                await self.decider.close()
+                self.dograh.close()
+                self._started = False
+                self._print_summary()
 
     async def __aenter__(self) -> "LeadPipeline":
         await self.start()
@@ -219,7 +245,7 @@ class LeadPipeline:
             item: _Item = await self._decision_q.get()
             try:
                 item.decision = await self.decider.decide(item.lead)
-                probs = ", ".join(f"{k} {v:.0%}" for k, v in item.decision.probabilities.items())
+                probs = ", ".join(f"{k} {v:.0%}" for k, v in item.decision.probabilities.items()) or "no business details"
                 phone = item.verification.e164
                 if not item.decision.qualified:
                     log("decide", f"SKIP {phone} {item.label} - not interested ({probs})")
@@ -283,8 +309,7 @@ class LeadPipeline:
         if not jobs:
             return
 
-        loop = asyncio.get_running_loop()
-        finishing: List[asyncio.Task] = []
+        progress_clock = [time.monotonic()]
 
         def on_started(cl: CampaignLead, run: Dict[str, Any], attempt: int) -> None:
             item: _Item = cl.payload
@@ -297,14 +322,15 @@ class LeadPipeline:
             if outcome.status == "called":
                 dur = f"{outcome.duration_seconds:.0f}s" if outcome.duration_seconds is not None else "-"
                 tries = f" | attempts: {outcome.attempts}" if outcome.attempts > 1 else ""
+                moved = " | TRANSFERRED" if is_transferred(outcome.raw) else ""
                 log("call", f"<- {cl.phone} Result: {outcome.disposition or 'unknown'} | {dur} | "
-                            f"tags: {', '.join(map(str, outcome.tags)) or '-'}{tries}")
+                            f"tags: {', '.join(map(str, outcome.tags)) or '-'}{tries}{moved}")
             else:
                 log("call", f"<- {cl.phone} {outcome.status.upper()}: {outcome.error}")
-            finishing.append(loop.create_task(self._finish(item, outcome.status, outcome.error or "")))
+            self._finish_nowait(item, outcome.status, outcome.error or "")
 
         async def follow(job: CampaignJob) -> None:
-            await job.monitor(self.dograh, on_started, on_result)
+            await job.monitor(self.dograh, on_started, on_result, progress_clock=progress_clock)
             # Every lead has its final result: make sure Dograh isn't left "running"
             try:
                 state = await asyncio.to_thread(self.dograh.stop_campaign, job.campaign_id)
@@ -316,16 +342,36 @@ class LeadPipeline:
                                 f"could not pause it now, will retry on exit: {e}")
 
         await asyncio.gather(*(follow(job) for job in jobs))
-        await asyncio.gather(*finishing)
 
     async def _writer_worker(self) -> None:
         warned_locked = False
+        warned_transfers_locked = False
         while True:
-            row = await self._results_q.get()
+            first = await self._results_q.get()
+            batch = [first]
+            while True:
+                try:
+                    batch.append(self._results_q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
             try:
-                self.store.append(row)
+                def append_batch() -> None:
+                    for row, lead in batch:
+                        self.store.append(row, lead)
+                        if row.get("call_transferred"):
+                            t_row, rest = transfer_row(row, lead or {})
+                            self.transfers.append(t_row, rest)
+
+                await asyncio.to_thread(append_batch)
                 if self._results_q.empty():  # batch saves while rows keep arriving
-                    if not self.store.save():
+                    if not await asyncio.to_thread(self.transfers.save):
+                        if not warned_transfers_locked:
+                            log("results", f"WARNING: {self.transfers.path.name} is open in another program; "
+                                           "will keep retrying - close it to let transfers save")
+                            warned_transfers_locked = True
+                    else:
+                        warned_transfers_locked = False
+                    if not await asyncio.to_thread(self.store.save):
                         if not warned_locked:
                             log("results", f"WARNING: {self.store.path.name} is open in another program; "
                                            "will keep retrying - close it to let results save")
@@ -335,16 +381,25 @@ class LeadPipeline:
             except Exception as e:
                 log("results", f"ERROR writing row: {e}")
             finally:
-                self._results_q.task_done()
+                for _ in batch:
+                    self._results_q.task_done()
 
     # ------------------------------------------------------------------ helpers
 
-    async def _finish(self, item: _Item, status: str, detail: str = "") -> None:
+    def _finish_nowait(self, item: _Item, status: str, detail: str = "") -> None:
         item.status, item.detail = status, detail
         self.stats[status.split(" ")[0]] += 1
-        await self._results_q.put(self._row(item))
+        if item.outcome is not None and is_transferred(item.outcome.raw):
+            self.stats["transferred"] += 1
+        if status in ("called", "call_timeout") and item.verification and item.verification.e164:
+            self.verifier.mark_called(item.verification.e164)
+        self._results_q.put_nowait((self._row(item), item.lead))
+
+    async def _finish(self, item: _Item, status: str, detail: str = "") -> None:
+        self._finish_nowait(item, status, detail)
 
     def _row(self, item: _Item) -> Dict[str, Any]:
+        """This program's columns for one lead (the lead's own fields are added by the results store)."""
         v, d, o = item.verification, item.decision, item.outcome
         row: Dict[str, Any] = {
             "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -376,25 +431,22 @@ class LeadPipeline:
                 "transcript_url": o.transcript_url,
                 "recording_url": o.recording_url,
                 "dograh_response": o.raw or None,
+                "call_transferred": True if is_transferred(o.raw) else None,
             })
-        reserved = set(FIXED_COLUMNS) | set(row)
-        for key, value in item.lead.items():
-            col = str(key)
-            row[f"lead_{col}" if col in reserved else col] = value
         return row
 
-    async def _final_save(self) -> None:
+    async def _final_save(self, store: ResultsStore) -> None:
         for attempt in range(12):
-            if self.store.save():
+            if await asyncio.to_thread(store.save):
                 return
             if attempt == 0:
-                log("results", f"{self.store.path.name} is open in another program - close it to save "
+                log("results", f"{store.path.name} is open in another program - close it to save "
                                "(retrying for 60s)")
             await asyncio.sleep(_STOP_TIMEOUT)
-        fallback = self.store.path.with_name(
-            f"{self.store.path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        self.store.path = fallback
-        self.store.save()
+        fallback = store.path.with_name(
+            f"{store.path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        store.path = fallback
+        await asyncio.to_thread(store.save)
         log("results", f"Saved to {fallback} instead")
 
     def _print_summary(self) -> None:
@@ -407,6 +459,8 @@ class LeadPipeline:
               f"skipped (missing data): {s['skipped_missing_data']} | "
               f"errors: {s['decision_error'] + s['error']}")
         print(f"Results: {self.store.path}", flush=True)
+        if s["transferred"]:
+            print(f"Transferred calls: {s['transferred']} -> {self.transfers.path}", flush=True)
 
 
 async def run_leads(
@@ -416,7 +470,7 @@ async def run_leads(
 ) -> Counter:
     """
     Run leads (list, generator or async generator of dicts) through the pipeline
-    in batches of `batch_size` (default LEAD_BATCH_SIZE = 1000): each batch is
+    in batches of `batch_size` (default LEAD_BATCH_SIZE = 300): each batch is
     verified, scored, put into campaigns and fully called before the next one.
     """
     size = max(1, batch_size or config.LEAD_BATCH_SIZE)

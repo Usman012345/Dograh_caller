@@ -1,6 +1,6 @@
 # Lead Streamer — Specification
 
-**Status:** specification only. No code exists yet.
+**Status:** implemented (`lead_streamer.py` v1.0).
 **Readers:** (1) the coding agent that will write the script, (2) the owner, who will check the build against it and test it live.
 **Words used in this document:** **MUST** / **MUST NOT** are hard rules. **SHOULD** means "do this unless there is a written reason not to".
 
@@ -32,7 +32,7 @@
 
 ## 1. What this is
 
-`lead_streamer` is a **standalone Python script** that runs on the scraper's deployment server, next to the scraper's PostgreSQL database. It hands leads from that database to the **dograh caller**, a separate system on another server, **1,000 at a time, as one batch, on request**.
+`lead_streamer` is a **standalone Python script** that runs on the scraper's deployment server, next to the scraper's PostgreSQL database. It hands leads from that database to the **dograh caller**, a separate system on another server, **300 at a time (`BATCH_SIZE`, at most 1,000), as one batch, on request**.
 
 - It is **entirely separate** from the scraper project. It is copied to the server on its own, has its own dependencies, and **imports nothing** from `Backend/`, `Database/`, `RAG/` or `AI Powered/`.
 - Its only connection to the scraper project is the **database**. It reads the scraper's tables and keeps its own record of which leads were sent.
@@ -52,20 +52,20 @@
    GET https://<PUBLIC_BASE_URL>/leads/next  ─────────────► │ proxy to 127.0.0.1:<BIND_PORT>
    Authorization: Bearer <STREAM_TOKEN>                     ▼
                                                        lead_streamer.py (always running)
-                                                            │ 1. pick next ≤1000 leads that are NOT SENT
+                                                            │ 1. pick next ≤300 leads that are NOT SENT 
                                                             │    or UPDATED SINCE SENT (must have a phone)
                                                             │ 2. mark them as sent  ─┐ one database
                                                             │ 3. commit             ─┘ transaction
    ◄──────────────── 200 {"status":"ok","leads":[...]} ─────┘ 4. reply with those leads
-   ... processes the 1,000 leads (calls them) ...
-   pings again for the next 1,000
+   ... processes the 300 leads (calls them) ...
+   a person presses Enter -> pings again for the next 300
    ...
    ◄── 200 {"status":"no_new_leads","message":"No new Leads available"}   (when all are sent)
    ... waits a while, pings again (new or updated leads may have arrived) ...
 ```
 
 - **Direction:** the dograh caller **pulls** from the streamer. The streamer never connects out to the dograh caller.
-- **One ping = one batch** of at most 1,000 leads, all in a single response.
+- **One ping = one batch** of at most `BATCH_SIZE` (300) leads, all in a single response.
 - A lead is marked as sent **when it is handed out in a response**. No confirmation comes back from the caller (see §9.4 for what that means).
 - **Updated leads are sent again.** The scraper increases `leads.content_version` whenever a lead's content changes. If that number is now higher than the version that was sent, the lead becomes due again and is sent with `"event": "updated"`.
 
@@ -122,7 +122,7 @@ At the top of `lead_streamer.py`, right after the imports, MUST be this block:
 # PASTE YOUR COMPANY SUBDOMAIN HERE once it is ready (HTTPS address, no path),
 # e.g. "https://leads.yourcompany.com". Leave "" to skip the host check.
 # An environment variable PUBLIC_BASE_URL (or the .env file) overrides this.
-PUBLIC_BASE_URL = ""
+PUBLIC_BASE_URL = "https://ai-sdr.grobots.ai"
 # ─────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -138,12 +138,12 @@ Settings are read in this order, first match wins: **environment variable → `.
 
 | Setting | Default | Rules |
 |---|---|---|
-| `PUBLIC_BASE_URL` | `""` (or the value in the script) | See §5.1. |
+| `PUBLIC_BASE_URL` | `https://ai-sdr.grobots.ai` (the value in the script) | See §5.1. |
 | `DATABASE_URL` | — **required** | PostgreSQL URL. MUST accept the scraper's form `postgresql+psycopg://user:pass@host:5432/dataops` by turning `postgresql+psycopg://` into `postgresql://`. |
 | `STREAM_TOKEN` | — **required** | Shared secret for the dograh caller. MUST be at least 32 characters, or startup fails. |
 | `BIND_HOST` | `127.0.0.1` | Interface to listen on. |
 | `BIND_PORT` | `8090` | Port to listen on. |
-| `BATCH_SIZE` | `1000` | Leads per ping. Values above 1000 are clamped to 1000 (warning logged); values below 1 fail startup. |
+| `BATCH_SIZE` | `300` | Leads per ping; keep equal to the caller's `LEAD_BATCH_SIZE`. Values above 1000 are clamped to 1000 (warning logged); values below 1 fail startup. |
 | `MAX_CONCURRENT_REQUESTS` | `8` | Requests handled at once. Extra requests get `503` straight away (§10). |
 | `DB_STATEMENT_TIMEOUT_MS` | `15000` | Applied to every database statement. |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | Socket timeout per client connection. |
@@ -161,12 +161,12 @@ Checked against the live schema (PostgreSQL 18).
 
 | Table | Columns used |
 |---|---|
-| `public.leads` | `id`, `organization_id`, `contact_id`, `record_kind`, `title`, `category`, `city`, `us_state`, `source_code`, `source_url`, `due_at`, `lead_metadata` (jsonb), `content_version` (int, not null), `created_at`, `updated_at` |
-| `public.organizations` | `id`, `name`, `website`, `industry` |
-| `public.contacts` | `id`, `full_name`, `title` |
+| `public.leads` | `id`, `organization_id`, `contact_id`, `record_kind`, `title`, `category`, `city`, `us_state`, `source_code`, `source_url`, `due_at`, `lead_metadata` (jsonb), `content_version` (int, not null), `created_at`, `updated_at`, `notes`, `status`, `last_activity`, `next_follow_up`, `external_id`, `first_seen_at`, `last_seen_at` |
+| `public.organizations` | `id`, `name`, `website`, `industry`, `domain`, `company_size`, `linkedin_url`, `raw_data` |
+| `public.contacts` | `id`, `full_name`, `title`, `first_name`, `last_name`, `department`, `linkedin_url`, `raw_data` |
 | `public.phones` | `organization_id`, `contact_id`, `phone_raw`, `normalized_phone`, `is_primary`, `created_at` |
 | `public.emails` | `organization_id`, `contact_id`, `email`, `email_status` (`VALID`, `RISKY`, `UNVERIFIED`, `INVALID` or null), `is_primary`, `created_at` |
-| `public.locations` | `organization_id`, `address_line1`, `address_line2`, `city`, `state`, `postal_code`, `normalized_location`, `raw_location`, `is_headquarters` |
+| `public.locations` | `organization_id`, `address_line1`, `address_line2`, `city`, `state`, `postal_code`, `country`, `normalized_location`, `raw_location`, `is_headquarters`, `created_at` |
 
 If a later scraper change renames any of these columns, the streamer needs a matching update. That is the only coupling.
 
@@ -237,9 +237,9 @@ Headers: `Authorization: Bearer <STREAM_TOKEN>`
 ```json
 {
   "status": "ok",
-  "count": 1000,
-  "new": 874,
-  "updated": 126,
+  "count": 300,
+  "new": 262,
+  "updated": 38,
   "served_at": "2026-11-19T14:02:11Z",
   "leads": [ { ...lead... }, ... ]
 }
@@ -324,13 +324,19 @@ Empty values are **omitted**: `null`, empty strings and whitespace, `"none"`, `"
 | `city` | string | `leads.city` → first location's `city` → `lead_metadata.city` |
 | `state` | string | `leads.us_state` → first location's `state` → `lead_metadata.state` |
 | `postal_code` | string | first location's `postal_code` → `lead_metadata.postal_code` / `zip` |
+| `country` | string | first location's `country` → `lead_metadata.country` / `raw_country` |
 | `location` | string | `"<city>, <state>"` when both exist, otherwise whichever exists |
 | `source` | string | `leads.source_code` (e.g. `bbb`, `googlemaps`) |
 | `source_url` | string | `leads.source_url` → `lead_metadata.source_url` |
 | `due_at` | string | `leads.due_at` as ISO-8601 (opportunities only) |
 | `created_at` | string | `leads.created_at`, ISO-8601 UTC |
 | `updated_at` | string | `leads.updated_at`, ISO-8601 UTC |
-| `extra` | object | Every other key of `lead_metadata` (§8.3) |
+| `notes`, `lead_status`, `external_id`, `last_activity`, `next_follow_up`, `first_seen_at`, `last_seen_at` | string | Direct columns from `public.leads` (timestamps ISO-8601 UTC) |
+| `domain`, `industry`, `company_size`, `organization_linkedin_url` | string | Direct columns from `public.organizations` (`industry` omitted if identical to `category`) |
+| `contact_first_name`, `contact_last_name`, `contact_department`, `contact_linkedin_url` | string | Direct columns from `public.contacts` |
+| `other_locations` | object[] | Remaining `public.locations` rows after the primary location (`address`, `city`, `state`, `postal_code`, `country`, `is_headquarters`) |
+| `other_website`, `alternate_*`, `professional_category` | string | Secondary distinct values from fallback sources (`alternate_company_name`, `alternate_contact_name`, `alternate_contact_title`, `alternate_category`, `professional_category`, `alternate_address`, `alternate_city`, `alternate_state`, `alternate_postal_code`, `alternate_country`, `alternate_source_url`) |
+| *flattened extra keys* | scalar / array | Remaining non-empty keys merged from `organizations.raw_data`, `contacts.raw_data`, and `lead_metadata` promoted directly as top-level `snake_case` keys (§8.3) |
 
 "First location" means `locations` rows of the lead's organization ordered by `is_headquarters DESC, created_at ASC`, first row.
 
@@ -338,22 +344,22 @@ Empty values are **omitted**: `null`, empty strings and whitespace, `"none"`, `"
 1. Candidates, in this order:
    1. `lead_metadata.phone`, split on `,` and `;`
    2. the contact's `phones` (`is_primary DESC, created_at ASC`)
-   3. the organization's `phones` (same order)
+   3. the organization's direct `phones` (`contact_id IS NULL`); if a contact-linked lead has no phones from `lead_metadata`, the contact, or direct org rows, falls back to all `phones` on the organization (for org-only leads with no `contact_id`, all organization `phones` are used directly)
 2. For each phone row use `phone_raw`, or `normalized_phone` if `phone_raw` is empty. Trim whitespace.
 3. Remove duplicates by comparing digits only, keeping the first occurrence and its original text.
 4. `phone` is the first item and `phones` is the whole list.
 5. No reformatting or validation; the dograh caller does that.
 
 ### 8.2 Emails
-1. Candidates: `lead_metadata.email` (split on `,` and `;`), then the contact's `emails`, then the organization's `emails`. The rows are ordered by status `VALID`, `RISKY`, `UNVERIFIED`, null, then `is_primary DESC`, `created_at ASC`.
-2. Drop any address whose lowercased value matches an `emails` row with `email_status = 'INVALID'`. This applies to addresses from `lead_metadata` too.
+1. Candidates: `lead_metadata.email` (split on `,` and `;`), then the contact's `emails`, then the organization's direct `emails` (`contact_id IS NULL`, falling back to all org `emails` when a contact-linked lead would otherwise have none). The rows are ordered by status `VALID`, `RISKY`, `UNVERIFIED`, null, then `is_primary DESC`, `created_at ASC`.
+2. Drop any address whose lowercased value matches an `emails` row with `email_status = 'INVALID'` (matching the same contact/org scope). This applies to addresses from `lead_metadata` too.
 3. Remove duplicates case-insensitively. `email` is the first item and `emails` is the whole list.
 
-### 8.3 `extra`
-- Start from `lead_metadata` (a JSON object; anything else is treated as `{}`).
-- Remove every key already used for a top-level field above: `organization_name`, `company_name`, `contact_name`, `contact_title`, `phone`, `email`, `website`, `category`, `professional_category`, `address`, `city`, `state`, `postal_code`, `zip`, `source_url`.
-- Remove internal bookkeeping keys: `retry_count`, `email_status`, `email_score`, `email_verified_at`, `email_retry_count`, `email_source`, `auto_enriched`, `profile_enriched`, `_is_enriched_update`, `scrapper_code`.
+### 8.3 Flattened extra fields
+- Merge `organizations.raw_data`, `contacts.raw_data`, and `lead_metadata` (later non-empty sources override earlier ones). Any wrapper objects named `extra`, `raw_data`, `scraped_data`, `metadata`, `details`, `custom_fields`, or `properties` are unpacked first.
+- Remove every depth-0 key already used for a top-level field (`organization_name`, `company_name`, `contact_name`, `contact_title`, `phone`, `email`, `website`, `category`, `professional_category`, `address`, `city`, `state`, `postal_code`, `zip`, `country`, `source_url`) and internal bookkeeping keys (`retry_count`, `email_status`, `email_score`, `email_verified_at`, `email_retry_count`, `email_source`, `auto_enriched`, `profile_enriched`, `_is_enriched_update`, `scrapper_code`), matching both raw lowercased names and normalized `snake_case` names.
 - Remove empty values (same rule as above), recursively inside nested objects and lists.
+- Flatten nested dicts up to depth 8 with `_`-joined `snake_case` keys and write each key at the top level of the lead payload. If a flattened key collides with an already-populated top-level key with a different scalar value, store it under `extra_<key>` (skipping exact case-insensitive duplicates).
 - Strings are sent **in full, never truncated**. Some RFP descriptions exceed 30,000 characters.
 
 ### 8.4 Example (shortened)
@@ -379,7 +385,10 @@ Empty values are **omitted**: `null`, empty strings and whitespace, `"none"`, `"
   "source_url": "https://www.bbb.org/…",
   "created_at": "2026-10-12T09:14:03Z",
   "updated_at": "2026-11-18T22:40:51Z",
-  "extra": { "rating": "A+", "is_accredited": true, "years_in_business": "12", "services_offered": "…" }
+  "rating": "A+",
+  "is_accredited": true,
+  "years_in_business": "12",
+  "services_offered": "…"
 }
 ```
 
@@ -389,12 +398,28 @@ Empty values are **omitted**: `null`, empty strings and whitespace, `"none"`, `"
 
 ### 9.1 Eligible and due
 
-A lead is **eligible** when it has at least one phone:
+A lead is **eligible** when it has at least one non-empty, non-placeholder phone (`'none'`, `'null'`, `'n/a'`, and blank/punctuation-only values are ignored):
 
 ```sql
-(  NULLIF(btrim(l.lead_metadata->>'phone'), '') IS NOT NULL
-OR EXISTS (SELECT 1 FROM public.phones p WHERE p.organization_id = l.organization_id)
-OR (l.contact_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.phones p WHERE p.contact_id = l.contact_id)) )
+(
+    NULLIF(lower(btrim(COALESCE(l.lead_metadata->>'phone', ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+    OR (l.organization_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.phones p
+        WHERE p.organization_id = l.organization_id
+          AND (
+              NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+              OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+          )
+    ))
+    OR (l.contact_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.phones p
+        WHERE p.contact_id = l.contact_id
+          AND (
+              NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+              OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+          )
+    ))
+)
 ```
 
 A lead is **due** when it is eligible **and** (`no row in sent_leads` **or** `sent_version < content_version`).
@@ -495,7 +520,7 @@ The process MUST NOT exit because of any per-request error. Startup configuratio
 One line per event to stdout, as `key=value` pairs:
 
 ```
-2026-11-19T14:02:11Z INFO  startup version=1.0 bind=127.0.0.1:8090 batch_size=1000 ping_url=https://leads.yourcompany.com/leads/next
+2026-11-19T14:02:11Z INFO  startup version=1.0 bind=127.0.0.1:8090 batch_size=300 ping_url=https://ai-sdr.grobots.ai/leads/next
 2026-11-19T14:02:11Z INFO  db_connected application_name=lead_streamer
 2026-11-19T14:05:40Z INFO  ping client=203.0.113.7 status=ok count=1000 new=874 updated=126 bytes=2341877 ms=1420
 2026-11-19T15:10:02Z INFO  ping client=203.0.113.7 status=no_new_leads count=0 ms=21
@@ -547,6 +572,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=lead-streamer
+Group=lead-streamer
 WorkingDirectory=/opt/lead_streamer
 ExecStart=/opt/lead_streamer/.venv/bin/python lead_streamer.py
 Restart=always
@@ -555,6 +582,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=25
 MemoryMax=300M
 NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -569,39 +598,25 @@ journalctl -u lead-streamer -f
 
 ### 15.3 nginx (`nginx-lead-streamer.conf`)
 
-For a dedicated subdomain (recommended):
-
-```nginx
-server {
-    listen 80;
-    server_name leads.yourcompany.com;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl;
-    server_name leads.yourcompany.com;
-    # ssl_certificate / ssl_certificate_key: added by certbot (or your control panel)
-
-    location / {
-        proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 120s;
-        client_max_body_size 1k;
-
-        # 1,000-lead responses are 2–3 MB of JSON; gzip cuts that to ~0.3–0.5 MB.
-        gzip on;
-        gzip_types application/json;
-        gzip_min_length 1024;
-    }
-}
-```
+For a dedicated subdomain (recommended): `nginx-lead-streamer.conf` in this folder. It is a
+plain-HTTP `server` block for `ai-sdr.grobots.ai` that proxies to `127.0.0.1:8090` with
+`proxy_set_header Host $host` (required by the host check), `X-Forwarded-For $remote_addr`,
+`proxy_read_timeout 120s` and gzip for JSON. It deliberately has no `listen 443 ssl`: a TLS block
+without a certificate makes `nginx -t` fail. `certbot --nginx -d ai-sdr.grobots.ai --redirect`
+adds TLS and the http->https redirect to the same block. Step-by-step: `GO_LIVE.md` in the
+dograh_caller folder.
 
 If the streamer lives under a path on an existing domain instead (e.g. `https://example.com/streamer/`), use `location /streamer/ { proxy_pass http://127.0.0.1:8090/; ... }`. The trailing `/` on `proxy_pass` strips the prefix. Then set `PUBLIC_BASE_URL=https://example.com/streamer`.
 
-**Before going live, the certificate MUST be valid.** For reference: on 2026-11-19, `https://ai-sdr.grobots.ai` had an **expired** certificate and returned 404 on every path. Whatever subdomain is used, check it with `curl -I https://<subdomain>/health`. That should return `200` without any `-k` flag.
+**Before going live, the certificate MUST be valid.** Check it with `curl -I https://ai-sdr.grobots.ai/health`; that should return `200` without any `-k` flag.
+
+State on 2026-11-20: `ai-sdr.grobots.ai` has only an A record, **167.88.38.179** (the
+CyberPanel/OpenLiteSpeed mail server, where an older push receiver answers `/health` with
+`{"status":"ok"}` and `/leads/next` with 404). The scraper server (79.143.180.241) already runs
+nginx 1.24 for `scrapper.grobots.ai` with ports 80 and 443 open, and serves unknown names with
+that site, so a request for `ai-sdr.grobots.ai` there currently reaches the scraper backend
+(`{"status":"healthy","service":"DataOps AI Backend"}`). Going live = add the site above, move
+the A record to 79.143.180.241, run certbot (`GO_LIVE.md`).
 
 ### 15.4 Once the subdomain is ready
 
@@ -617,13 +632,13 @@ The dograh caller is a separate project; this section is the agreement it must f
 
 1. Call `GET <PUBLIC_BASE_URL>/leads/next` with `Authorization: Bearer <STREAM_TOKEN>`.
 2. On `"status": "ok"`: submit every item of `leads` to its pipeline. Each item is a ready-made lead dict with `phone` / `phones`.
-3. After it has finished processing that batch, ping again.
-4. On `"status": "no_new_leads"`: wait (recommended 10–30 minutes), then ping again.
-5. On `503`: wait `retry_after_seconds`, then ping again. On `401` / `421`: stop and alert a person, because that is a configuration problem.
+3. After it has finished processing that batch, **wait for a person to confirm**, then ping again. The caller never pings again on its own (`pull_leads.py`: Enter = next ping, `q` = quit).
+4. On `"status": "no_new_leads"`: report it and wait for a person before pinging again.
+5. On `503`: report `retry_after_seconds` and wait for a person before pinging again. On `401` / `421`: stop and alert a person, because that is a configuration problem.
 6. Use `lead_id` + `content_version` to recognise a lead; an `event: "updated"` lead was sent before. Whether to call an updated lead again is the caller's decision.
 7. Never ping in parallel. Pings are processed one at a time anyway.
-8. Use a request timeout of at least **120 s**, and send `Accept-Encoding: gzip`. Most HTTP libraries do the latter by default. A full batch is 1,000 leads and about 2–3 MB of JSON before compression.
-9. Treat the whole batch as one unit. All 1,000 leads arrive in one response and are already marked as sent when it arrives (§9.4).
+8. Use a request timeout of at least **120 s**, and send `Accept-Encoding: gzip`. Most HTTP libraries do the latter by default. A full batch is 300 leads, about 0.7–1 MB of JSON before compression (1,000 leads: 2–3 MB).
+9. Treat the whole batch as one unit. All leads of a batch arrive in one response and are already marked as sent when it arrives (§9.4), so the caller saves the batch to disk before processing it.
 
 ---
 
@@ -636,18 +651,32 @@ Run these on the scraper server after deployment. Replace `$URL` and `$TOKEN`.
 | 1 | `curl -s https://$URL/health` | `{"status":"alive","database":"ok"}` |
 | 2 | `curl -s -o /dev/null -w "%{http_code}" https://$URL/leads/next` (no token) | `401` |
 | 3 | `curl -s -H "Authorization: Bearer $TOKEN" https://$URL/stats` | Counts. `eligible` matches SQL A below. |
-| 4 | `curl -s -H "Authorization: Bearer $TOKEN" https://$URL/leads/next \| python3 -m json.tool \| head -60` | `"status": "ok"`, `count` ≤ 1000, each lead has `lead_id` and `phone` |
+| 4 | `curl -s -H "Authorization: Bearer $TOKEN" https://$URL/leads/next \| python3 -m json.tool \| head -60` | `"status": "ok"`, `count` ≤ 300, each lead has `lead_id` and `phone` |
 | 5 | SQL B below | Increased by exactly the `count` from step 4 |
 | 6 | Repeat step 4 | Different `lead_id`s (none repeated) |
 | 7 | Keep pinging until done | Ends with `"status": "no_new_leads"`, `"message": "No new Leads available"`; the service stays `active` |
 | 8 | `systemctl status lead-streamer` after a day | `active (running)`, memory well under 300M |
 
 ```sql
--- A. eligible leads (with a phone)
+-- A. eligible leads (with a non-placeholder phone)
 SELECT count(*) FROM public.leads l
-WHERE NULLIF(btrim(l.lead_metadata->>'phone'), '') IS NOT NULL
-   OR EXISTS (SELECT 1 FROM public.phones p WHERE p.organization_id = l.organization_id)
-   OR (l.contact_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.phones p WHERE p.contact_id = l.contact_id));
+WHERE NULLIF(lower(btrim(COALESCE(l.lead_metadata->>'phone', ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+   OR (l.organization_id IS NOT NULL AND EXISTS (
+       SELECT 1 FROM public.phones p
+       WHERE p.organization_id = l.organization_id
+         AND (
+             NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+             OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+         )
+   ))
+   OR (l.contact_id IS NOT NULL AND EXISTS (
+       SELECT 1 FROM public.phones p
+       WHERE p.contact_id = l.contact_id
+         AND (
+             NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+             OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \t\r\n,;')), '') NOT IN ('none', 'null', 'n/a')
+         )
+   ));
 
 -- B. how many have been sent
 SELECT count(*) FROM lead_stream.sent_leads;

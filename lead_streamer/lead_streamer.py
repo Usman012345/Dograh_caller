@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hmac
+import http
 import http.server
 import json
 import math
@@ -27,7 +28,7 @@ from psycopg import errors as pg_errors
 # PASTE YOUR COMPANY SUBDOMAIN HERE once it is ready (HTTPS address, no path),
 # e.g. "https://leads.yourcompany.com". Leave "" to skip the host check.
 # An environment variable PUBLIC_BASE_URL (or the .env file) overrides this.
-PUBLIC_BASE_URL = ""
+PUBLIC_BASE_URL = "https://ai-sdr.grobots.ai"
 # ─────────────────────────────────────────────────────────────────────────────
 
 VERSION = "1.0"
@@ -50,7 +51,18 @@ _EXTRA_TOP_LEVEL_KEYS = frozenset({
     "state",
     "postal_code",
     "zip",
+    "country",
     "source_url",
+})
+
+_WRAPPER_KEYS = frozenset({
+    "extra",
+    "raw_data",
+    "scraped_data",
+    "metadata",
+    "details",
+    "custom_fields",
+    "properties",
 })
 
 _EXTRA_INTERNAL_KEYS = frozenset({
@@ -81,18 +93,74 @@ _LOG_LABELS = {
 }
 
 _ELIGIBLE_SQL = """(
-    NULLIF(btrim(l.lead_metadata->>'phone'), '') IS NOT NULL
+    NULLIF(lower(btrim(COALESCE(l.lead_metadata->>'phone', ''), E' \\t\\r\\n,;')), '') NOT IN ('none', 'null', 'n/a')
     OR (l.organization_id IS NOT NULL AND EXISTS (
-        SELECT 1 FROM public.phones p WHERE p.organization_id = l.organization_id
+        SELECT 1 FROM public.phones p
+        WHERE p.organization_id = l.organization_id
+          AND (
+              NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \\t\\r\\n,;')), '') NOT IN ('none', 'null', 'n/a')
+              OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \\t\\r\\n,;')), '') NOT IN ('none', 'null', 'n/a')
+          )
     ))
     OR (l.contact_id IS NOT NULL AND EXISTS (
-        SELECT 1 FROM public.phones p WHERE p.contact_id = l.contact_id
+        SELECT 1 FROM public.phones p
+        WHERE p.contact_id = l.contact_id
+          AND (
+              NULLIF(lower(btrim(COALESCE(p.phone_raw, ''), E' \\t\\r\\n,;')), '') NOT IN ('none', 'null', 'n/a')
+              OR NULLIF(lower(btrim(COALESCE(p.normalized_phone, ''), E' \\t\\r\\n,;')), '') NOT IN ('none', 'null', 'n/a')
+          )
     ))
 )"""
 
 
 class DbUnavailableError(Exception):
     """Raised when PostgreSQL is unreachable, times out, or drops a connection."""
+
+    def __init__(self, code: str = "database_unavailable") -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class SchemaMismatchError(Exception):
+    """The scraper's tables lack columns the streamer reads (wrong database or old scraper version)."""
+
+
+# Every scraper column the streamer reads (spec section 6.1). Checked once per
+# connection before the first ping, so a wrong database fails with a clear message.
+REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "leads": (
+        "id", "organization_id", "contact_id", "record_kind", "title", "category", "city",
+        "us_state", "source_code", "source_url", "due_at", "lead_metadata", "content_version",
+        "created_at", "updated_at", "notes", "status", "last_activity", "next_follow_up",
+        "external_id", "first_seen_at", "last_seen_at",
+    ),
+    "organizations": ("id", "name", "website", "industry", "domain", "company_size", "linkedin_url", "raw_data"),
+    "contacts": ("id", "full_name", "title", "first_name", "last_name", "department", "linkedin_url", "raw_data"),
+    "phones": ("organization_id", "contact_id", "phone_raw", "normalized_phone", "is_primary", "created_at"),
+    "emails": ("organization_id", "contact_id", "email", "email_status", "is_primary", "created_at"),
+    "locations": (
+        "organization_id", "address_line1", "address_line2", "city", "state", "postal_code",
+        "country", "normalized_location", "raw_location", "is_headquarters", "created_at",
+    ),
+}
+
+
+def missing_columns(present: typing.Iterable[tuple[str, str]]) -> list[str]:
+    """`present` = (table, column) pairs found in schema public. Returns 'table.column' still missing."""
+    have = {(t, c) for t, c in present}
+    missing = []
+    for table, cols in REQUIRED_COLUMNS.items():
+        if not any(t == table for t, _ in have):
+            missing.append(f"{table} (table)")
+            continue
+        missing.extend(f"{table}.{c}" for c in cols if (table, c) not in have)
+    return missing
+
+
+def _unavailable(exc: BaseException) -> DbUnavailableError:
+    if isinstance(exc, SchemaMismatchError):
+        return DbUnavailableError("schema_mismatch")
+    return DbUnavailableError()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,15 +277,9 @@ def load_config() -> Config:
     warnings: list[str] = []
     secrets: list[str] = []
 
-    raw_public = ""
-    for candidate in (
-        os.environ.get("PUBLIC_BASE_URL"),
-        dotenv.get("PUBLIC_BASE_URL"),
-        PUBLIC_BASE_URL,
-    ):
-        if candidate is not None and candidate.strip():
-            raw_public = candidate.strip()
-            break
+    # Environment variable -> .env -> the value at the top of this file. A line
+    # "PUBLIC_BASE_URL=" (empty) in .env turns the host check off.
+    raw_public = (_get_setting("PUBLIC_BASE_URL", dotenv, PUBLIC_BASE_URL) or "").strip()
 
     public_base_url = raw_public.rstrip("/")
     expected_host = ""
@@ -283,7 +345,7 @@ def load_config() -> Config:
     raw_port = _get_setting("BIND_PORT", dotenv, "8090") or "8090"
     bind_port = _parse_int_setting("BIND_PORT", raw_port, errors, min_val=1, max_val=65535)
 
-    raw_batch = _get_setting("BATCH_SIZE", dotenv, "1000") or "1000"
+    raw_batch = _get_setting("BATCH_SIZE", dotenv, "300") or "300"
     batch_size = _parse_int_setting("BATCH_SIZE", raw_batch, errors, min_val=1)
     if batch_size is not None and batch_size > 1000:
         warnings.append(f"batch_size_clamped requested={batch_size} effective=1000")
@@ -378,7 +440,7 @@ class StructuredLogger:
         text = re.sub(r"password='[^']*'", "password=***", text, flags=re.IGNORECASE)
         text = re.sub(r"password=\S+", "password=***", text, flags=re.IGNORECASE)
         for secret in self._secrets:
-            if secret:
+            if secret and len(secret) >= 8:
                 text = text.replace(secret, "***")
         if len(text) > 200:
             text = text[:197] + "..."
@@ -454,6 +516,26 @@ def _format_utc_iso(dt: datetime.datetime | None) -> str | None:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _as_dict(raw: typing.Any) -> dict[str, typing.Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _to_snake_case(key: str) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", text)
+    return text.strip("_").lower()
+
+
 def _clean_extra_value(val: typing.Any) -> typing.Any:
     if val is None:
         return _MISSING
@@ -484,15 +566,76 @@ def _clean_extra_value(val: typing.Any) -> typing.Any:
     return val
 
 
-def _build_extra(meta: dict[str, typing.Any]) -> dict[str, typing.Any] | None:
-    cleaned: dict[str, typing.Any] = {}
-    for key, val in meta.items():
-        if key in _EXTRA_TOP_LEVEL_KEYS or key in _EXTRA_INTERNAL_KEYS:
+def _merge_extra_sources(*sources: typing.Any) -> dict[str, typing.Any]:
+    merged: dict[str, typing.Any] = {}
+    for raw_src in sources:
+        src = _as_dict(raw_src)
+        if not src:
             continue
-        cleaned_val = _clean_extra_value(val)
-        if cleaned_val is not _MISSING:
-            cleaned[str(key)] = cleaned_val
-    return cleaned if cleaned else None
+        unpacked_keys: set[str] = set()
+        for key, raw_nested in src.items():
+            if str(key).lower() in _WRAPPER_KEYS:
+                nested = _as_dict(raw_nested)
+                if nested:
+                    unpacked_keys.add(str(key))
+                    for sub_k, sub_v in nested.items():
+                        if _clean_extra_value(sub_v) is not _MISSING or sub_k not in merged:
+                            merged[str(sub_k)] = sub_v
+        for key, val in src.items():
+            if str(key) in unpacked_keys:
+                continue
+            if _clean_extra_value(val) is not _MISSING or key not in merged:
+                merged[str(key)] = val
+    return merged
+
+
+def _flatten_extra(
+    extra_dict: dict[str, typing.Any],
+    prefix: str = "",
+    depth: int = 0,
+) -> list[tuple[str, typing.Any]]:
+    items: list[tuple[str, typing.Any]] = []
+    for raw_key, raw_val in extra_dict.items():
+        key_str = str(raw_key)
+        snake_key = _to_snake_case(key_str)
+        if not snake_key:
+            continue
+        if depth == 0:
+            lowered_key = key_str.lower()
+            if (
+                lowered_key in _EXTRA_TOP_LEVEL_KEYS
+                or snake_key in _EXTRA_TOP_LEVEL_KEYS
+                or lowered_key in _EXTRA_INTERNAL_KEYS
+                or snake_key in _EXTRA_INTERNAL_KEYS
+            ):
+                continue
+        cleaned = _clean_extra_value(raw_val)
+        if cleaned is _MISSING:
+            continue
+        full_key = f"{prefix}_{snake_key}" if prefix else snake_key
+        if isinstance(cleaned, dict) and depth < 8:
+            items.extend(_flatten_extra(cleaned, prefix=full_key, depth=depth + 1))
+        else:
+            items.append((full_key, cleaned))
+    return items
+
+
+def _set_if_diff(
+    payload: dict[str, typing.Any],
+    key: str,
+    candidates: tuple[typing.Any, ...],
+    *existing_values: typing.Any,
+) -> None:
+    existing_norm = {
+        val.strip().casefold()
+        for val in existing_values
+        if isinstance(val, str) and val.strip()
+    }
+    for candidate in candidates:
+        cleaned = _clean_str(candidate)
+        if cleaned is not None and cleaned.casefold() not in existing_norm:
+            payload[key] = cleaned
+            return
 
 
 def _build_phones(
@@ -545,7 +688,11 @@ def _build_lead_payload(
     emails_by_org: dict[str, list[str]],
     invalid_by_contact: dict[str, set[str]],
     invalid_by_org: dict[str, set[str]],
-    locations_by_org: dict[str, tuple[typing.Any, ...]],
+    locations_by_org: dict[str, list[tuple[typing.Any, ...]]],
+    *,
+    phones_by_org_direct: dict[str, list[str]] | None = None,
+    emails_by_org_direct: dict[str, list[str]] | None = None,
+    invalid_by_org_direct: dict[str, set[str]] | None = None,
 ) -> dict[str, typing.Any]:
     (
         lead_id,
@@ -563,15 +710,31 @@ def _build_lead_payload(
         content_version,
         created_at,
         updated_at,
+        lead_notes,
+        lead_status,
+        lead_last_activity,
+        lead_next_follow_up,
+        lead_external_id,
+        lead_first_seen_at,
+        lead_last_seen_at,
         org_name,
         org_website,
         org_industry,
+        org_domain,
+        org_company_size,
+        org_linkedin_url,
+        org_raw_data,
         contact_full_name,
         contact_title,
+        contact_first_name,
+        contact_last_name,
+        contact_department,
+        contact_linkedin_url,
+        contact_raw_data,
         was_sent,
     ) = row
 
-    meta: dict[str, typing.Any] = raw_meta if isinstance(raw_meta, dict) else {}
+    meta = _as_dict(raw_meta)
 
     payload: dict[str, typing.Any] = {
         "lead_id": str(lead_id),
@@ -607,27 +770,63 @@ def _build_lead_payload(
     ):
         payload["title"] = cleaned_title
 
-    phones = _build_phones(
-        meta,
-        phones_by_contact.get(contact_id, []) if contact_id is not None else [],
-        phones_by_org.get(org_id, []) if org_id is not None else [],
-    )
+    direct_org_phones = (
+        phones_by_org_direct.get(org_id, [])
+        if phones_by_org_direct is not None
+        else phones_by_org.get(org_id, [])
+    ) if org_id is not None else []
+    if contact_id is not None:
+        phones = _build_phones(
+            meta,
+            phones_by_contact.get(contact_id, []),
+            direct_org_phones,
+        )
+        if not phones and org_id is not None:
+            phones = _build_phones(meta, [], phones_by_org.get(org_id, []))
+    else:
+        phones = _build_phones(
+            meta,
+            [],
+            phones_by_org.get(org_id, []) if org_id is not None else [],
+        )
     if phones:
         payload["phone"] = phones[0]
         payload["phones"] = phones
 
+    direct_org_emails = (
+        emails_by_org_direct.get(org_id, [])
+        if emails_by_org_direct is not None
+        else emails_by_org.get(org_id, [])
+    ) if org_id is not None else []
+    direct_org_invalid = (
+        invalid_by_org_direct.get(org_id, set())
+        if invalid_by_org_direct is not None
+        else invalid_by_org.get(org_id, set())
+    ) if org_id is not None else set()
+
     invalid_emails: set[str] = set()
     if contact_id is not None and contact_id in invalid_by_contact:
         invalid_emails.update(invalid_by_contact[contact_id])
-    if org_id is not None and org_id in invalid_by_org:
-        invalid_emails.update(invalid_by_org[org_id])
+    invalid_emails.update(direct_org_invalid)
 
-    emails = _build_emails(
-        meta,
-        emails_by_contact.get(contact_id, []) if contact_id is not None else [],
-        emails_by_org.get(org_id, []) if org_id is not None else [],
-        invalid_emails,
-    )
+    if contact_id is not None:
+        emails = _build_emails(
+            meta,
+            emails_by_contact.get(contact_id, []),
+            direct_org_emails,
+            invalid_emails,
+        )
+        if not emails and org_id is not None:
+            fallback_invalid = set(invalid_emails) | invalid_by_org.get(org_id, set())
+            emails = _build_emails(meta, [], emails_by_org.get(org_id, []), fallback_invalid)
+    else:
+        all_invalid = invalid_by_org.get(org_id, set()) if org_id is not None else set()
+        emails = _build_emails(
+            meta,
+            [],
+            emails_by_org.get(org_id, []) if org_id is not None else [],
+            all_invalid,
+        )
     if emails:
         payload["email"] = emails[0]
         payload["emails"] = emails
@@ -645,9 +844,10 @@ def _build_lead_payload(
     if category is not None:
         payload["category"] = category
 
-    loc = locations_by_org.get(org_id) if org_id is not None else None
+    locs = locations_by_org.get(org_id, []) if org_id is not None else []
+    loc = locs[0] if locs else None
     if loc is not None:
-        _, addr1, addr2, loc_city, loc_state, loc_postal, loc_norm, loc_raw = loc
+        _, addr1, addr2, loc_city, loc_state, loc_postal, loc_country, loc_norm, loc_raw, _ = loc
         clean_a1 = _clean_str(addr1)
         clean_a2 = _clean_str(addr2)
         if clean_a1 and clean_a2:
@@ -659,6 +859,7 @@ def _build_lead_payload(
         loc_city = None
         loc_state = None
         loc_postal = None
+        loc_country = None
         loc_norm = None
         loc_raw = None
 
@@ -677,6 +878,10 @@ def _build_lead_payload(
     postal_code = _first_str(loc_postal, meta.get("postal_code"), meta.get("zip"))
     if postal_code is not None:
         payload["postal_code"] = postal_code
+
+    country = _first_str(loc_country, meta.get("country"), meta.get("raw_country"))
+    if country is not None:
+        payload["country"] = country
 
     if city and state:
         payload["location"] = f"{city}, {state}"
@@ -705,9 +910,170 @@ def _build_lead_payload(
     if formatted_updated_at is not None:
         payload["updated_at"] = formatted_updated_at
 
-    extra = _build_extra(meta)
-    if extra is not None:
-        payload["extra"] = extra
+    cleaned_notes = _clean_str(lead_notes)
+    if cleaned_notes is not None:
+        payload["notes"] = cleaned_notes
+
+    cleaned_lead_status = _clean_str(lead_status)
+    if cleaned_lead_status is not None:
+        payload["lead_status"] = cleaned_lead_status
+
+    cleaned_external_id = _clean_str(lead_external_id)
+    if cleaned_external_id is not None:
+        payload["external_id"] = cleaned_external_id
+
+    cleaned_last_activity = _clean_str(lead_last_activity)
+    if cleaned_last_activity is not None:
+        payload["last_activity"] = cleaned_last_activity
+
+    formatted_next_follow_up = _format_utc_iso(lead_next_follow_up)
+    if formatted_next_follow_up is not None:
+        payload["next_follow_up"] = formatted_next_follow_up
+
+    formatted_first_seen = _format_utc_iso(lead_first_seen_at)
+    if formatted_first_seen is not None:
+        payload["first_seen_at"] = formatted_first_seen
+
+    formatted_last_seen = _format_utc_iso(lead_last_seen_at)
+    if formatted_last_seen is not None:
+        payload["last_seen_at"] = formatted_last_seen
+
+    cleaned_domain = _clean_str(org_domain)
+    if cleaned_domain is not None:
+        payload["domain"] = cleaned_domain
+
+    cleaned_industry = _clean_str(org_industry)
+    if cleaned_industry is not None and not (
+        category is not None and cleaned_industry.casefold() == category.casefold()
+    ):
+        payload["industry"] = cleaned_industry
+
+    cleaned_company_size = _clean_str(org_company_size)
+    if cleaned_company_size is not None:
+        payload["company_size"] = cleaned_company_size
+
+    cleaned_org_linkedin = _clean_str(org_linkedin_url)
+    if cleaned_org_linkedin is not None:
+        payload["organization_linkedin_url"] = cleaned_org_linkedin
+
+    cleaned_first_name = _clean_str(contact_first_name)
+    if cleaned_first_name is not None:
+        payload["contact_first_name"] = cleaned_first_name
+
+    cleaned_last_name = _clean_str(contact_last_name)
+    if cleaned_last_name is not None:
+        payload["contact_last_name"] = cleaned_last_name
+
+    cleaned_department = _clean_str(contact_department)
+    if cleaned_department is not None:
+        payload["contact_department"] = cleaned_department
+
+    cleaned_contact_linkedin = _clean_str(contact_linkedin_url)
+    if cleaned_contact_linkedin is not None:
+        payload["contact_linkedin_url"] = cleaned_contact_linkedin
+
+    if len(locs) > 1:
+        other_locs: list[dict[str, typing.Any]] = []
+        for extra_loc in locs[1:]:
+            _, e_a1, e_a2, e_city, e_state, e_postal, e_country, e_norm, e_raw, e_hq = extra_loc
+            ea1 = _clean_str(e_a1)
+            ea2 = _clean_str(e_a2)
+            e_street = f"{ea1}, {ea2}" if (ea1 and ea2) else (ea1 or ea2)
+            e_addr = _first_str(e_street, e_norm, e_raw)
+            e_c = _clean_str(e_city)
+            e_s = _clean_str(e_state)
+            e_p = _clean_str(e_postal)
+            e_co = _clean_str(e_country)
+            if not any((e_addr, e_c, e_s, e_p, e_co)):
+                continue
+            loc_obj: dict[str, typing.Any] = {}
+            if e_addr is not None:
+                loc_obj["address"] = e_addr
+            if e_c is not None:
+                loc_obj["city"] = e_c
+            if e_s is not None:
+                loc_obj["state"] = e_s
+            if e_p is not None:
+                loc_obj["postal_code"] = e_p
+            if e_co is not None:
+                loc_obj["country"] = e_co
+            loc_obj["is_headquarters"] = bool(e_hq)
+            other_locs.append(loc_obj)
+        if other_locs:
+            payload["other_locations"] = other_locs
+
+    _set_if_diff(payload, "other_website", (org_website, meta.get("website")), website)
+    _set_if_diff(
+        payload,
+        "alternate_company_name",
+        (meta.get("organization_name"), meta.get("company_name")),
+        company,
+    )
+    _set_if_diff(
+        payload,
+        "alternate_contact_name",
+        (meta.get("contact_name"),),
+        contact_name,
+        company,
+    )
+    _set_if_diff(
+        payload,
+        "alternate_contact_title",
+        (meta.get("contact_title"),),
+        resolved_contact_title,
+    )
+    _set_if_diff(
+        payload,
+        "alternate_category",
+        (meta.get("category"),),
+        category,
+        cleaned_industry,
+    )
+    _set_if_diff(
+        payload,
+        "professional_category",
+        (meta.get("professional_category"),),
+        category,
+        cleaned_industry,
+        payload.get("alternate_category"),
+    )
+    _set_if_diff(payload, "alternate_address", (loc_street, loc_norm, loc_raw), address)
+    _set_if_diff(payload, "alternate_city", (loc_city, meta.get("city")), city)
+    _set_if_diff(payload, "alternate_state", (loc_state, meta.get("state")), state)
+    _set_if_diff(
+        payload,
+        "alternate_postal_code",
+        (meta.get("postal_code"), meta.get("zip")),
+        postal_code,
+    )
+    _set_if_diff(
+        payload,
+        "alternate_country",
+        (meta.get("country"), meta.get("raw_country")),
+        country,
+    )
+    _set_if_diff(
+        payload,
+        "alternate_source_url",
+        (meta.get("source_url"),),
+        resolved_source_url,
+    )
+
+    merged_extra = _merge_extra_sources(org_raw_data, contact_raw_data, meta)
+    for extra_key, extra_val in _flatten_extra(merged_extra):
+        if extra_key not in payload:
+            payload[extra_key] = extra_val
+        else:
+            existing_val = payload[extra_key]
+            if (
+                not isinstance(existing_val, (dict, list, bool))
+                and not isinstance(extra_val, (dict, list, bool))
+                and str(existing_val).strip().casefold() == str(extra_val).strip().casefold()
+            ):
+                continue
+            alt_key = f"extra_{extra_key}"
+            if alt_key not in payload:
+                payload[alt_key] = extra_val
 
     return payload
 
@@ -740,7 +1106,28 @@ class PgStore:
         except Exception:
             pass
 
+    def _check_scraper_schema_locked(self, conn: psycopg.Connection) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name, column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ANY(%s);
+                """,
+                (list(REQUIRED_COLUMNS),),
+            )
+            present = cur.fetchall()
+        conn.rollback()
+        missing = missing_columns(present)
+        if missing:
+            shown = ", ".join(missing[:8]) + (f" (+{len(missing) - 8} more)" if len(missing) > 8 else "")
+            raise SchemaMismatchError(
+                f"scraper tables in this database do not match: missing {shown}. "
+                "Check DATABASE_URL points at the scraper's database and its migrations are applied."
+            )
+
     def _ensure_schema_locked(self, conn: psycopg.Connection) -> None:
+        self._check_scraper_schema_locked(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT to_regclass('lead_stream.sent_leads') IS NOT NULL;")
             exists_row = cur.fetchone()
@@ -800,7 +1187,7 @@ class PgStore:
             except Exception as exc:
                 self._close_locked()
                 self._logger.error(
-                    "db_unavailable",
+                    "schema_mismatch" if isinstance(exc, SchemaMismatchError) else "db_unavailable",
                     error=self._logger.sanitize_error(exc),
                     action="retry_startup",
                 )
@@ -816,7 +1203,7 @@ class PgStore:
                     except Exception as exc:
                         self._close_locked()
                         self._logger.error(
-                            "db_unavailable",
+                            "schema_mismatch" if isinstance(exc, SchemaMismatchError) else "db_unavailable",
                             error=self._logger.sanitize_error(exc),
                             action="retry_startup",
                         )
@@ -841,12 +1228,13 @@ class PgStore:
                 conn = self._ensure_connected_locked()
             except Exception as exc:
                 self._close_locked()
+                mismatch = isinstance(exc, SchemaMismatchError)
                 self._logger.error(
-                    "db_unavailable",
+                    "schema_mismatch" if mismatch else "db_unavailable",
                     error=self._logger.sanitize_error(exc),
                     action="reconnect_next_request",
                 )
-                return "unavailable"
+                return "schema_mismatch" if mismatch else "unavailable"
 
             for attempt in range(2):
                 try:
@@ -896,11 +1284,11 @@ class PgStore:
             except Exception as exc:
                 self._close_locked()
                 self._logger.error(
-                    "db_unavailable",
+                    "schema_mismatch" if isinstance(exc, SchemaMismatchError) else "db_unavailable",
                     error=self._logger.sanitize_error(exc),
                     action="reconnect_next_request",
                 )
-                raise DbUnavailableError() from exc
+                raise _unavailable(exc) from exc
 
             for attempt in range(2):
                 try:
@@ -948,7 +1336,7 @@ class PgStore:
                             error=self._logger.sanitize_error(exc),
                             action="reconnect_next_request",
                         )
-                        raise DbUnavailableError() from exc
+                        raise _unavailable(exc) from exc
                     try:
                         conn = self._connect_locked()
                     except Exception as recon_exc:
@@ -958,7 +1346,7 @@ class PgStore:
                             error=self._logger.sanitize_error(recon_exc),
                             action="reconnect_next_request",
                         )
-                        raise DbUnavailableError() from recon_exc
+                        raise _unavailable(recon_exc) from recon_exc
                 except psycopg.Error as exc:
                     self._safe_rollback_locked(conn)
                     self._logger.error(
@@ -966,7 +1354,7 @@ class PgStore:
                         error=self._logger.sanitize_error(exc),
                         action="stats_query_error",
                     )
-                    raise DbUnavailableError() from exc
+                    raise _unavailable(exc) from exc
         raise DbUnavailableError()
 
     def _begin_batch_tx_locked(self) -> psycopg.Connection:
@@ -979,7 +1367,7 @@ class PgStore:
                 error=self._logger.sanitize_error(exc),
                 action="reconnect_next_request",
             )
-            raise DbUnavailableError() from exc
+            raise _unavailable(exc) from exc
 
         for attempt in range(2):
             try:
@@ -997,7 +1385,7 @@ class PgStore:
                         error=self._logger.sanitize_error(exc),
                         action="reconnect_next_request",
                     )
-                    raise DbUnavailableError() from exc
+                    raise _unavailable(exc) from exc
                 try:
                     conn = self._connect_locked()
                 except Exception as recon_exc:
@@ -1007,7 +1395,7 @@ class PgStore:
                         error=self._logger.sanitize_error(recon_exc),
                         action="reconnect_next_request",
                     )
-                    raise DbUnavailableError() from recon_exc
+                    raise _unavailable(recon_exc) from recon_exc
             except psycopg.Error as exc:
                 self._safe_rollback_locked(conn)
                 self._logger.error(
@@ -1015,7 +1403,7 @@ class PgStore:
                     error=self._logger.sanitize_error(exc),
                     action="advisory_lock_error",
                 )
-                raise DbUnavailableError() from exc
+                raise _unavailable(exc) from exc
         raise DbUnavailableError()
 
     def fetch_next_batch(self) -> dict[str, typing.Any]:
@@ -1066,11 +1454,27 @@ class PgStore:
                             l.content_version,
                             l.created_at,
                             l.updated_at,
+                            l.notes,
+                            l.status,
+                            l.last_activity,
+                            l.next_follow_up,
+                            l.external_id,
+                            l.first_seen_at,
+                            l.last_seen_at,
                             o.name,
                             o.website,
                             o.industry,
+                            o.domain,
+                            o.company_size,
+                            o.linkedin_url,
+                            o.raw_data,
                             c.full_name,
                             c.title,
+                            c.first_name,
+                            c.last_name,
+                            c.department,
+                            c.linkedin_url,
+                            c.raw_data,
                             (s.lead_id IS NOT NULL) AS was_sent
                         FROM public.leads l
                         LEFT JOIN public.organizations o ON o.id = l.organization_id
@@ -1101,6 +1505,7 @@ class PgStore:
 
                     phones_by_contact: dict[str, list[str]] = {}
                     phones_by_org: dict[str, list[str]] = {}
+                    phones_by_org_direct: dict[str, list[str]] = {}
                     if org_ids or contact_ids:
                         if org_ids and contact_ids:
                             phone_where = (
@@ -1128,11 +1533,15 @@ class PgStore:
                                 phones_by_contact.setdefault(p_contact_id, []).append(phone_val)
                             if p_org_id is not None and p_org_id in org_id_set:
                                 phones_by_org.setdefault(p_org_id, []).append(phone_val)
+                                if p_contact_id is None:
+                                    phones_by_org_direct.setdefault(p_org_id, []).append(phone_val)
 
                     emails_by_contact: dict[str, list[str]] = {}
                     emails_by_org: dict[str, list[str]] = {}
+                    emails_by_org_direct: dict[str, list[str]] = {}
                     invalid_by_contact: dict[str, set[str]] = {}
                     invalid_by_org: dict[str, set[str]] = {}
+                    invalid_by_org_direct: dict[str, set[str]] = {}
                     if org_ids or contact_ids:
                         if org_ids and contact_ids:
                             email_where = (
@@ -1171,25 +1580,31 @@ class PgStore:
                                     invalid_by_contact.setdefault(e_contact_id, set()).add(lowered)
                                 if e_org_id is not None and e_org_id in org_id_set:
                                     invalid_by_org.setdefault(e_org_id, set()).add(lowered)
+                                    if e_contact_id is None:
+                                        invalid_by_org_direct.setdefault(e_org_id, set()).add(lowered)
                             else:
                                 if e_contact_id is not None and e_contact_id in contact_id_set:
                                     emails_by_contact.setdefault(e_contact_id, []).append(cleaned_email)
                                 if e_org_id is not None and e_org_id in org_id_set:
                                     emails_by_org.setdefault(e_org_id, []).append(cleaned_email)
+                                    if e_contact_id is None:
+                                        emails_by_org_direct.setdefault(e_org_id, []).append(cleaned_email)
 
-                    locations_by_org: dict[str, tuple[typing.Any, ...]] = {}
+                    locations_by_org: dict[str, list[tuple[typing.Any, ...]]] = {}
                     if org_ids:
                         cur.execute(
                             """
-                            SELECT DISTINCT ON (organization_id)
+                            SELECT
                                 organization_id,
                                 address_line1,
                                 address_line2,
                                 city,
                                 state,
                                 postal_code,
+                                country,
                                 normalized_location,
-                                raw_location
+                                raw_location,
+                                is_headquarters
                             FROM public.locations
                             WHERE organization_id = ANY(%(org_ids)s::varchar[])
                             ORDER BY organization_id, is_headquarters DESC, created_at ASC;
@@ -1197,7 +1612,7 @@ class PgStore:
                             {"org_ids": org_ids},
                         )
                         for loc_row in cur.fetchall():
-                            locations_by_org[loc_row[0]] = loc_row
+                            locations_by_org.setdefault(loc_row[0], []).append(loc_row)
 
                     leads: list[dict[str, typing.Any]] = []
                     sent_ids: list[str] = []
@@ -1215,6 +1630,9 @@ class PgStore:
                             invalid_by_contact,
                             invalid_by_org,
                             locations_by_org,
+                            phones_by_org_direct=phones_by_org_direct,
+                            emails_by_org_direct=emails_by_org_direct,
+                            invalid_by_org_direct=invalid_by_org_direct,
                         )
                         leads.append(payload)
                         sent_ids.append(payload["lead_id"])
@@ -1254,11 +1672,11 @@ class PgStore:
                 if not isinstance(exc, pg_errors.QueryCanceled):
                     self._close_locked()
                 self._logger.error(
-                    "db_unavailable",
+                    "schema_mismatch" if isinstance(exc, SchemaMismatchError) else "db_unavailable",
                     error=self._logger.sanitize_error(exc),
                     action="reconnect_next_request",
                 )
-                raise DbUnavailableError() from exc
+                raise _unavailable(exc) from exc
             except psycopg.Error as exc:
                 self._safe_rollback_locked(conn)
                 self._logger.error(
@@ -1266,7 +1684,7 @@ class PgStore:
                     error=self._logger.sanitize_error(exc),
                     action="batch_query_error",
                 )
-                raise DbUnavailableError() from exc
+                raise _unavailable(exc) from exc
             except Exception:
                 self._safe_rollback_locked(conn)
                 raise
@@ -1512,10 +1930,11 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
                 self.server.logger.info("stats", client=client, bytes=nbytes, ms=elapsed_ms)
                 return
 
-        except DbUnavailableError:
+        except DbUnavailableError as exc:
+            # "schema_mismatch": wrong database / scraper migrations missing (see the log)
             self._send_json(
                 503,
-                {"status": "error", "error": "database_unavailable", "retry_after_seconds": 30},
+                {"status": "error", "error": exc.code, "retry_after_seconds": 30},
                 extra_headers={"Retry-After": "30"},
             )
         except Exception as exc:
@@ -1543,9 +1962,61 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
+def check_setup(config: Config, logger: StructuredLogger) -> int:
+    """`python lead_streamer.py --check`: test the database and schema, change nothing, exit."""
+    print(f"Ping URL:   {config.ping_url}")
+    print(f"Batch size: {config.batch_size}")
+    try:
+        conn = psycopg.connect(config.database_url, connect_timeout=5, autocommit=True,
+                               application_name="lead_streamer_check")
+    except Exception as exc:
+        print(f"FAIL database: cannot connect: {logger.sanitize_error(exc)}")
+        return 1
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database(), current_user, split_part(version(), ' ', 2);")
+            db, user, version = cur.fetchone()
+            print(f"OK   database: {db} as {user} (PostgreSQL {version})")
+            cur.execute(
+                "SELECT table_name, column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = ANY(%s);",
+                (list(REQUIRED_COLUMNS),),
+            )
+            missing = missing_columns(cur.fetchall())
+            if missing:
+                print("FAIL schema: missing " + ", ".join(missing))
+                print("     DATABASE_URL must point at the scraper's database with its migrations applied.")
+                return 1
+            print("OK   schema: every table and column the streamer reads exists")
+            cur.execute(f"SELECT count(*), count(*) FILTER (WHERE {_ELIGIBLE_SQL}) FROM public.leads l;")
+            total, eligible = cur.fetchone()
+            print(f"OK   leads: {total} in total, {eligible} with a phone (these are what gets sent)")
+            cur.execute("SELECT to_regclass('lead_stream.sent_leads') IS NOT NULL;")
+            if cur.fetchone()[0]:
+                cur.execute("SELECT count(*), max(sent_at) FROM lead_stream.sent_leads;")
+                sent, last = cur.fetchone()
+                print(f"OK   lead_stream.sent_leads: {sent} sent so far (last {last})")
+            else:
+                cur.execute("SELECT has_database_privilege(current_user, current_database(), 'CREATE');")
+                can_create = cur.fetchone()[0]
+                state = "will be created on first start" if can_create else                     "MISSING and this user cannot create it (see README: least-privilege setup)"
+                print(f"{'OK  ' if can_create else 'FAIL'} lead_stream.sent_leads: {state}")
+                if not can_create:
+                    return 1
+    except Exception as exc:
+        print(f"FAIL check: {logger.sanitize_error(exc)}")
+        return 1
+    finally:
+        conn.close()
+    print("All checks passed.")
+    return 0
+
+
 def main() -> int:
     config = load_config()
     logger = StructuredLogger(config.log_level, config.secret_values)
+    if "--check" in sys.argv[1:]:
+        return check_setup(config, logger)
     for warning in config.startup_warnings:
         logger.warn("config_warning", detail=warning)
 

@@ -42,11 +42,40 @@ DOGRAH_API_KEY=your-dograh-key
 DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 ```
 
-The `.env` in the parent `Task10` folder works too, and it is already set up.
+A `.env` file in the parent folder is also checked if present.
 Keys belong only in `.env`, never in code.
 
 **c. Publish your agents in Dograh.** Calls always use an agent's *published*
 version, so publish after every change you make to an agent.
+
+**d. Check everything** (takes no leads, calls nobody):
+
+```bash
+python pull_leads.py --check
+```
+
+It confirms the Jev key, `services.yaml`, each Dograh agent, that the lead
+streamer answers at `LEAD_SOURCE_URL`, and that it accepts the token.
+
+### Running it on a server (Linux)
+
+Copy this folder to the server **with its `.env`**, then:
+
+```bash
+bash install.sh               # .venv + requirements + the --check above; no root needed
+tmux new -s caller            # keeps it running if your SSH connection drops
+.venv/bin/python pull_leads.py
+```
+
+Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. If the
+process is killed or the SSH session ends anyway, it stops the same way as
+Ctrl+C: this run's Dograh campaigns are paused and the unfinished batch is
+kept and offered again on the next start.
+
+On Windows: `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`,
+then `.venv\Scripts\python pull_leads.py`. (`bash install.sh` also works in Git Bash.)
+
+Tests: `pip install -r requirements-dev.txt`, then `python -m pytest`.
 
 ---
 
@@ -55,9 +84,13 @@ version, so publish after every change you make to an agent.
 **Step 1 — Prepare the spreadsheet** (`.xlsx`, `.csv` or `.json`).
 The first row holds the column names. You need:
 - **a phone column**, for example `Phone`, `Phone(s)`, `Phone Number` or `Mobile`
-  (several numbers in one cell are fine);
+  (several numbers in one cell are fine; **fax numbers are never called**);
 - **columns describing the business**, for example company, industry,
   description and city. The more Jev knows about a business, the better it decides.
+
+Data from the scraper can be unstructured (any field names, nested data, lists,
+JSON text): phone numbers are found wherever they are, and Jev only gets the
+fields that describe the business. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §6–7.
 
 | Company | Industry | Notes | City / State | Phone(s) |
 |---|---|---|---|---|
@@ -78,8 +111,8 @@ python main.py
 
 > ⚠️ **Every run is live.** Businesses that pass the check really get called.
 
-Leads are processed **1,000 at a time**: the program checks and scores a batch,
-calls everyone in it, then moves on to the next 1,000.
+Leads are processed **300 at a time** (`LEAD_BATCH_SIZE`): the program checks and scores a batch,
+calls everyone in it, then moves on to the next 300.
 
 ---
 
@@ -125,6 +158,14 @@ have to pause them there yourself.
 Open **`output/call_results.xlsx`**. Close it in Excel while the program runs,
 because Excel locks the file.
 
+**Transferred calls** also go to a separate file, **`output/transferred_calls.xlsx`**:
+one row per business whose call the agent transferred, grouped by day. It starts with
+their details (business, contact name and title, phone called, email, website, address,
+city, state, category), then the call (service, campaign, agent, duration, what the agent
+collected on the call, transcript and recording links), then any other information the
+lead had. The file appears with the first transfer. In `call_results.xlsx` those rows have
+`call_transferred` = TRUE.
+
 - One row per business, grouped by day, **newest day on top**.
 - The most useful columns:
 
@@ -141,7 +182,7 @@ because Excel locks the file.
 |---|---|
 | `called` | The call happened; see `call_disposition` |
 | `not_interested` | Jev scored it below 85% for every service; not called |
-| `dropped_...` | Phone problem: `not_us`, `invalid_number`, `special_number` (e.g. 900), `duplicate`, `already_called`, `no_phone` |
+| `dropped_...` | Phone problem: `not_us`, `invalid_number`, `special_number` (e.g. 900), `fax_only` (only fax numbers — fax numbers are never called), `duplicate`, `already_called`, `no_phone` |
 | `call_failed` / `call_timeout` | Dograh couldn't place the call, or it never finished |
 | `skipped_missing_data` | The agent's script needs information this business didn't have |
 
@@ -150,28 +191,58 @@ because Excel locks the file.
 
 ---
 
-## 6. Sending leads from the scraper (code)
+## 6. Getting leads from the scraper's lead streamer
+
+Setting it up on the servers for the first time: [GO_LIVE.md](GO_LIVE.md).
+
+The [lead streamer](lead_streamer/) runs on the scraper side and hands out leads
+at **`https://ai-sdr.grobots.ai`**, 300 per ping. Put its token in `.env`:
+
+```ini
+LEAD_SOURCE_TOKEN=the-streamer's-STREAM_TOKEN
+# LEAD_SOURCE_URL=https://ai-sdr.grobots.ai   (default)
+```
+
+Then run:
+
+```bash
+python pull_leads.py
+```
+
+1. It pings the streamer and receives one batch of up to **300** leads.
+2. It saves the batch to `output/pulled_batches/`, then processes **all** of it
+   (check numbers → Jev → campaigns → every call finished → results sheet).
+3. It **waits for you**: press **Enter** to ping for the next batch, or type
+   **q** to quit. It never pings again on its own. That's also true after
+   "No new Leads available" or an error.
+
+If it is stopped mid-batch (Ctrl+C, crash, error), the batch stays in
+`output/pulled_batches/*.pending.json` and the next start asks whether to finish
+it first. That matters because the streamer marks leads as sent the moment it
+hands them out. Numbers that were already called are skipped.
+
+## 7. Sending leads from other code
 
 ```python
-import sys; sys.path.insert(0, r"C:\Users\adil.zia\Desktop\Tasks\Task10\dograh_caller")
+import sys; sys.path.insert(0, r"C:\path\to\dograh_caller")
 from main import run
 
 run({"company": "Summit Concrete Co", "category": "Concrete subcontractor",
      "location": "Denver, CO", "phone": "(303) 555-0142"})   # one business
-run(list_of_business_dicts)                                    # many (processed 1,000 at a time)
+run(list_of_business_dicts)                                    # many (processed 300 at a time)
 ```
 
 See [examples/from_python.py](examples/from_python.py) for streaming leads one by one.
 
 ---
 
-## 7. Changing how it behaves
+## 8. Changing how it behaves
 
 | I want to… | Do this |
 |---|---|
 | Add or change a service (who it targets, which agent calls) | Edit [services.yaml](services.yaml); no code. See [SERVICES.md](SERVICES.md) |
 | Call fewer, surer leads (or more) | Set `INTEREST_THRESHOLD=0.9` (stricter) or `0.8` in `.env` |
-| Change the batch size | Set `LEAD_BATCH_SIZE=500` in `.env` |
+| Change the batch size | Set `LEAD_BATCH_SIZE=500` in `.env` (and `BATCH_SIZE` in the streamer's `.env` to match) |
 | Change retries for busy / no-answer calls | `CAMPAIGN_MAX_RETRIES`, `CAMPAIGN_RETRY_DELAY_SECONDS` in `.env` |
 | Run a different file once without editing main.py | `python main.py other.xlsx --limit 5` |
 
@@ -179,7 +250,7 @@ All settings: [DOCUMENTATION.md](DOCUMENTATION.md), section 4.
 
 ---
 
-## 8. Common problems
+## 9. Common problems
 
 | Problem | Fix |
 |---|---|

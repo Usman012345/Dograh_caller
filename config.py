@@ -67,6 +67,11 @@ JEV_MODEL: str = _env("JEV_MODEL", "jev-1.14.0")
 # the lead is interested in that service is >= this value (0.85 = 85%).
 INTEREST_THRESHOLD: float = _env_float("INTEREST_THRESHOLD", 0.85)
 
+# What Jev gets per lead: only descriptive fields (see decision_maker.lead_state),
+# each cut to JEV_MAX_FIELD_CHARS, all together at most JEV_MAX_STATE_CHARS.
+JEV_MAX_FIELD_CHARS: int = _env_int("JEV_MAX_FIELD_CHARS", 2000)
+JEV_MAX_STATE_CHARS: int = _env_int("JEV_MAX_STATE_CHARS", 12000)
+
 # Where services (DraftLiner, Paradise, ...) are described. See SERVICES.md.
 SERVICES_FILE: Path = Path(_env("SERVICES_FILE", str(PROJECT_DIR / "services.yaml")))
 
@@ -106,12 +111,42 @@ RETRY_GRACE_SECONDS: int = _env_int("RETRY_GRACE_SECONDS", 120)
 # ------------------------------------------------------------------------------
 # Leads are processed in batches of this size: a batch is verified, scored,
 # put into campaigns and fully called before the next batch is taken.
-LEAD_BATCH_SIZE: int = _env_int("LEAD_BATCH_SIZE", 1000)
+LEAD_BATCH_SIZE: int = _env_int("LEAD_BATCH_SIZE", 300)
 
 # Max items waiting between two stages (back-pressure: faster stages pause).
 QUEUE_MAXSIZE: int = _env_int("QUEUE_MAXSIZE", 100)
 # Parallel Jev requests.
 DECISION_CONCURRENCY: int = _env_int("DECISION_CONCURRENCY", 8)
 
+# Most lead fields that get their own column in the results sheet. Leads are
+# unstructured, so without a limit every new field name would add a column.
+# Fields beyond the limit are kept (as JSON) in the "other_lead_fields" column.
+RESULTS_MAX_LEAD_COLUMNS: int = _env_int("RESULTS_MAX_LEAD_COLUMNS", 80)
+
 # Results spreadsheet (created if missing, appended to if it exists).
 RESULTS_FILE: Path = Path(_env("RESULTS_FILE", str(PROJECT_DIR / "output" / "call_results.xlsx")))
+
+# Separate spreadsheet with only the businesses whose call the agent transferred
+# (to a person / another number), with their details - for whoever takes them over.
+TRANSFERS_FILE: Path = Path(_env("TRANSFERS_FILE", str(PROJECT_DIR / "output" / "transferred_calls.xlsx")))
+# Call dispositions / tags that mean "transferred". Dograh records "transfer_call"
+# (phone transfer) or "call_transferred" (PBX transfer); a transfer tool can be set
+# to record its own disposition - add that here (comma-separated). Any disposition
+# or tag containing "transfer" (but not "fail") also counts.
+TRANSFER_DISPOSITIONS = frozenset(
+    d.strip().lower() for d in _env("TRANSFER_DISPOSITIONS", "transfer_call,call_transferred").split(",") if d.strip()
+)
+
+# ------------------------------------------------------------------------------
+# Lead source: the lead streamer on the scraper side (used by pull_leads.py)
+# ------------------------------------------------------------------------------
+# The streamer's public address (its PUBLIC_BASE_URL). pull_leads.py pings
+# <this>/leads/next and gets one batch of up to 300 leads per ping.
+LEAD_SOURCE_URL: str = _env("LEAD_SOURCE_URL", "https://ai-sdr.grobots.ai", "STREAMER_URL").rstrip("/")
+# The streamer's STREAM_TOKEN (shared secret). Only in .env, never in code.
+LEAD_SOURCE_TOKEN: str = _env("LEAD_SOURCE_TOKEN", "", "STREAM_TOKEN")
+# Seconds to wait for a ping's answer (the streamer contract asks for >= 120).
+LEAD_SOURCE_TIMEOUT: int = max(120, _env_int("LEAD_SOURCE_TIMEOUT", 180))
+# Every received batch is saved here first, so a crash or Ctrl+C never loses
+# leads (the streamer marks them as sent the moment it hands them out).
+PULLED_BATCHES_DIR: Path = Path(_env("PULLED_BATCHES_DIR", str(PROJECT_DIR / "output" / "pulled_batches")))

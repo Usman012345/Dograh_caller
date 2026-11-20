@@ -23,18 +23,21 @@ regrouped into this layout when it is opened.
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+import config
+
 SHEET_NAME = "results"
 EXCEL_CELL_LIMIT = 32_000
+_UNKNOWN_DATE_LABEL = "unknown date"
 
 FIXED_COLUMNS: List[str] = [
     "processed_at",
@@ -55,10 +58,95 @@ FIXED_COLUMNS: List[str] = [
     "call_disposition",
     "call_duration_s",
     "call_tags",
+    "call_transferred",      # True when the agent transferred the call (also in TRANSFERS_FILE)
     "transcript_url",
     "recording_url",
     "dograh_response",       # the run as returned by Dograh (JSON)
+    "other_lead_fields",     # lead fields beyond RESULTS_MAX_LEAD_COLUMNS (JSON)
 ]
+OTHER_LEAD_FIELDS = "other_lead_fields"
+
+# --- Transferred calls (config.TRANSFERS_FILE): one row per transferred business
+TRANSFERS_SHEET_NAME = "transferred"
+# Contact details first (taken from the lead, whatever its field names), then the call.
+TRANSFER_CONTACT_COLUMNS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("business", ("company", "company_name", "business_name", "business", "organization_name",
+                  "organization", "org_name", "name")),
+    ("contact_name", ("contact_name", "contact", "full_name", "owner_name", "owner", "contact_person")),
+    ("contact_title", ("contact_title", "job_title", "position", "role")),
+    ("email", ("email", "email_address", "e_mail", "contact_email")),
+    ("website", ("website", "web_site", "url", "site", "domain")),
+    ("address", ("address", "street_address", "street", "address_line1")),
+    ("city", ("city", "town")),
+    ("state", ("state", "us_state", "province", "region")),
+    ("postal_code", ("postal_code", "zip", "zip_code", "postcode")),
+    ("category", ("category", "industry", "business_type", "type_of_business")),
+    ("lead_id", ("lead_id", "id", "record_id")),
+]
+TRANSFER_COLUMNS: List[str] = (
+    ["transferred_at", "phone_called"]
+    + [name for name, _ in TRANSFER_CONTACT_COLUMNS]
+    + ["interested_service", "campaign_name", "agent_name", "call_disposition", "call_duration_s",
+       "collected_by_agent", "transcript_url", "recording_url", "dograh_run_id", OTHER_LEAD_FIELDS]
+)
+# gathered_context keys that are Dograh bookkeeping, not information about the business
+_SYSTEM_CONTEXT_KEYS = {
+    "provider", "call_id", "nodes_visited", "call_disposition", "mapped_call_disposition", "call_tags",
+    "external_pbx_transferred", "transfer_state", "agent_transfers", "extracted_variables",
+}
+
+
+def _norm(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+
+
+def _readable(values: Dict[str, Any]) -> Optional[str]:
+    parts = [f"{k}: {v if not isinstance(v, (dict, list)) else json.dumps(v, default=str)}"
+             for k, v in values.items() if v not in (None, "", [], {})]
+    return "; ".join(parts) or None
+
+
+def transfer_row(row: Dict[str, Any], lead: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    The transfers-sheet row for one result `row` (pipeline columns) and its `lead`.
+    Returns (row, remaining lead fields): fields used for a contact column are
+    left out of the remainder, so nothing appears twice.
+    """
+    by_norm: Dict[str, Any] = {}
+    for key in lead:
+        by_norm.setdefault(_norm(key), key)
+    used = set()
+    out: Dict[str, Any] = {
+        "transferred_at": row.get("processed_at"),
+        "phone_called": row.get("phone_e164"),
+    }
+    for column, candidates in TRANSFER_CONTACT_COLUMNS:
+        for cand in candidates:
+            key = by_norm.get(cand)
+            if key is not None and key not in used and lead.get(key) not in (None, "", [], {}):
+                out[column] = lead[key]
+                used.add(key)
+                break
+    for name in ("interested_service", "campaign_name", "agent_name", "call_disposition",
+                 "call_duration_s", "transcript_url", "recording_url", "dograh_run_id"):
+        out[name] = row.get(name)
+
+    run = row.get("dograh_response")
+    if isinstance(run, str):
+        try:
+            run = json.loads(run)
+        except ValueError:
+            run = {}
+    gathered = (run or {}).get("gathered_context") or {}
+    collected = gathered.get("extracted_variables")
+    if not isinstance(collected, dict):
+        collected = {}
+    collected = {**{k: v for k, v in gathered.items() if k not in _SYSTEM_CONTEXT_KEYS}, **collected}
+    out["collected_by_agent"] = _readable(collected)
+
+    remaining = {k: v for k, v in lead.items() if k not in used}
+    return out, remaining
+
 
 _HEADER_FONT = Font(bold=True, color="FFFFFF")
 _HEADER_FILL = PatternFill("solid", fgColor="1F2937")
@@ -85,128 +173,243 @@ def _day_of(value: Any) -> str:
     return text if _DATE_RE.match(text) else ""
 
 
+def _sort_key(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value or "")
+
+
 class ResultsStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, fixed_columns: Optional[List[str]] = None,
+                 sheet_name: str = SHEET_NAME, time_column: str = "processed_at"):
         self.path = Path(path)
+        self._fixed = list(fixed_columns or FIXED_COLUMNS)
+        self._fixed_set = set(self._fixed)
+        self._sheet_name = sheet_name
+        self._time_col = time_column
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._groups: Dict[str, List[Dict[str, Any]]] = {}
+        self.columns: List[str] = []
+        needs_rewrite = False
+
         if self.path.exists():
             self.wb = load_workbook(self.path)
-            self.ws = self.wb[SHEET_NAME] if SHEET_NAME in self.wb.sheetnames else self.wb.active
-            self.columns = [c.value for c in self.ws[1] if c.value]
+            self.ws = self.wb[sheet_name] if sheet_name in self.wb.sheetnames else self.wb.active
+            self._sheet_title = self.ws.title
+            needs_rewrite = self._load_existing_sheet()
         else:
             self.wb = Workbook()
             self.ws = self.wb.active
-            self.ws.title = SHEET_NAME
-            self.columns = []
-        self._ensure_columns(FIXED_COLUMNS)
-        self.ws.freeze_panes = "A2"
-        self._dirty = False
+            self.ws.title = sheet_name
+            self._sheet_title = sheet_name
 
-        # Day block currently being written and the row where its next result goes
-        self._current_day: Optional[str] = None
-        self._next_row = 0
+        existing_cols = set(self.columns)
+        for name in self._fixed:
+            if name not in existing_cols:
+                self.columns.append(name)
+                existing_cols.add(name)
+                if self.path.exists():
+                    needs_rewrite = True
 
-        if self.ws.max_row > 1:
-            self._regroup()
+        self._dirty = needs_rewrite
+        # Columns that hold lead fields (everything that isn't ours)
+        self._lead_columns = {c for c in self.columns if not self._is_own_column(c)}
 
     # ------------------------------------------------------------------ layout
 
-    def _ensure_columns(self, names: List[str]) -> None:
-        for name in names:
-            if name not in self.columns:
-                self.columns.append(name)
-                col = len(self.columns)
-                cell = self.ws.cell(row=1, column=col, value=name)
-                cell.font = _HEADER_FONT
-                cell.fill = _HEADER_FILL
-                self.ws.column_dimensions[get_column_letter(col)].width = max(14, min(len(name) + 4, 40))
-
-    def _is_date_row(self, r: int) -> bool:
-        first = self.ws.cell(row=r, column=1).value
-        if not (isinstance(first, str) and _DATE_RE.match(first)):
+    def _load_existing_sheet(self) -> bool:
+        """Read existing rows into day groups; returns True if the sheet layout needs normalizing."""
+        all_rows = list(self.ws.iter_rows(values_only=True))
+        if not all_rows:
             return False
-        return all(self.ws.cell(row=r, column=c).value in (None, "")
-                   for c in range(2, self.ws.max_column + 1))
 
-    def _write_date_row(self, r: int, day: str) -> None:
-        for c in range(1, len(self.columns) + 1):
-            cell = self.ws.cell(row=r, column=c, value=day if c == 1 else None)
-            cell.fill = _DATE_FILL
-            if c == 1:
-                cell.font = _DATE_FONT
-
-    def _write_data_row(self, r: int, values: List[Any]) -> None:
-        for c, value in enumerate(values, start=1):
-            cell = self.ws.cell(row=r, column=c, value=value)
-            cell.fill = PatternFill(fill_type=None)
-            cell.font = Font()
-
-    def _regroup(self) -> None:
-        """Rewrite existing rows into the newest-day-first layout (idempotent)."""
-        ncols = len(self.columns)
-        day_col = self.columns.index("processed_at") + 1
-        groups: "OrderedDict[str, List[List[Any]]]" = OrderedDict()
-        for r in range(2, self.ws.max_row + 1):
-            if self._is_date_row(r):
+        header_row = all_rows[0]
+        col_positions: List[Tuple[int, str]] = []
+        seen_cols: set[str] = set()
+        needs_rewrite = False
+        for idx, val in enumerate(header_row):
+            if val is None:
                 continue
-            values = [self.ws.cell(row=r, column=c).value for c in range(1, ncols + 1)]
-            if all(v in (None, "") for v in values):
+            name = str(val).strip()
+            if not name or name in seen_cols:
+                needs_rewrite = True
                 continue
-            groups.setdefault(_day_of(values[day_col - 1]), []).append(values)
+            seen_cols.add(name)
+            col_positions.append((idx, name))
+        self.columns = [name for _, name in col_positions]
 
-        # Newest day first; rows without a readable date go last.
-        # Within a day: oldest first (new results of the day go below).
-        days = sorted((d for d in groups if d), reverse=True) + ([""] if "" in groups else [])
-        if self.ws.max_row > 1:
-            self.ws.delete_rows(2, self.ws.max_row - 1)
+        seen_banners: List[str] = []
+        banner_counts: Dict[str, int] = {}
+        last_banner_day: Optional[str] = None
+
+        for row_tuple in all_rows[1:]:
+            if all(v in (None, "") for v in row_tuple):
+                needs_rewrite = True
+                continue
+            first = row_tuple[0] if row_tuple else None
+            is_banner = (
+                isinstance(first, str)
+                and (bool(_DATE_RE.match(first)) or first == _UNKNOWN_DATE_LABEL)
+                and all(v in (None, "") for v in row_tuple[1:])
+            )
+            if is_banner:
+                banner_day = "" if first == _UNKNOWN_DATE_LABEL else first
+                seen_banners.append(banner_day)
+                banner_counts[banner_day] = banner_counts.get(banner_day, 0) + 1
+                last_banner_day = banner_day
+                continue
+
+            row_dict: Dict[str, Any] = {}
+            for idx, col_name in col_positions:
+                if idx < len(row_tuple):
+                    val = row_tuple[idx]
+                    if val is not None:
+                        row_dict[col_name] = val
+            if not row_dict:
+                needs_rewrite = True
+                continue
+
+            day = _day_of(row_dict.get(self._time_col))
+            if last_banner_day is None or day != last_banner_day:
+                needs_rewrite = True
+            self._groups.setdefault(day, []).append(row_dict)
+
+        if any(count > 1 for count in banner_counts.values()):
+            needs_rewrite = True
+        if any(day not in self._groups for day in seen_banners):
+            needs_rewrite = True
+
+        expected_days = sorted((d for d in self._groups if d), reverse=True) + ([""] if "" in self._groups else [])
+        if seen_banners != expected_days:
+            needs_rewrite = True
+
+        for day, rows in list(self._groups.items()):
+            keys = [_sort_key(r.get(self._time_col)) for r in rows]
+            if keys != sorted(keys):
+                self._groups[day] = sorted(rows, key=lambda r: _sort_key(r.get(self._time_col)))
+                needs_rewrite = True
+
+        return needs_rewrite
+
+    def _rebuild_sheet(self) -> None:
+        was_active = self.wb.active is not None and self.wb.active.title == self._sheet_title
+        if self._sheet_title in self.wb.sheetnames:
+            idx = self.wb.sheetnames.index(self._sheet_title)
+            del self.wb[self._sheet_title]
+            ws = self.wb.create_sheet(title=self._sheet_title, index=idx)
+        else:
+            ws = self.wb.create_sheet(title=self._sheet_title, index=0)
+        if was_active:
+            self.wb.active = ws
+        self.ws = ws
+        ws.freeze_panes = "A2"
+
+        for c, name in enumerate(self.columns, start=1):
+            cell = ws.cell(row=1, column=c, value=name)
+            cell.font = _HEADER_FONT
+            cell.fill = _HEADER_FILL
+            ws.column_dimensions[get_column_letter(c)].width = max(14, min(len(name) + 4, 40))
+
+        days = sorted((d for d in self._groups if d), reverse=True) + ([""] if "" in self._groups else [])
         r = 2
         for day in days:
-            self._write_date_row(r, day or "unknown date")
+            label = day or _UNKNOWN_DATE_LABEL
+            for c in range(1, len(self.columns) + 1):
+                cell = ws.cell(row=r, column=c, value=label if c == 1 else None)
+                cell.fill = _DATE_FILL
+                if c == 1:
+                    cell.font = _DATE_FONT
             r += 1
-            for values in sorted(groups[day], key=lambda v: str(v[day_col - 1] or "")):
-                self._write_data_row(r, values)
+            for row_dict in self._groups[day]:
+                for c, name in enumerate(self.columns, start=1):
+                    val = row_dict.get(name)
+                    if val is not None:
+                        ws.cell(row=r, column=c, value=val)
                 r += 1
-        self._dirty = True
+
+    # ------------------------------------------------------------------ lead fields
+
+    def _is_own_column(self, name: str) -> bool:
+        """Columns written by this program (not copied from the lead)."""
+        return name in self._fixed_set or name.startswith("prob_")
+
+    def _lead_values(self, own: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Map a lead's fields to sheet columns without ever overwriting a value:
+          - a field whose name is one of our columns ("status", "detail", ...) is
+            renamed to "lead.<name>" ("lead.status") - always the same column, and
+            a name real lead fields don't use; if even that is taken, "lead.status_2", ...
+          - each field gets its own column while the sheet has fewer than
+            RESULTS_MAX_LEAD_COLUMNS lead columns; further new fields are kept
+            together (as JSON) in the "other_lead_fields" column.
+        """
+        lead_names = {str(k) for k in lead}
+        taken = set(own)
+        values: Dict[str, Any] = {}
+        overflow: Dict[str, Any] = {}
+        for key, value in lead.items():
+            name = str(key)
+            if self._is_own_column(name) or name in taken:
+                n, candidate = 1, f"lead.{name}"
+                while (self._is_own_column(candidate) or candidate in taken
+                       or (candidate in lead_names and candidate != name)):
+                    n += 1
+                    candidate = f"lead.{name}_{n}"
+                name = candidate
+            taken.add(name)
+
+            if name in self._lead_columns:
+                values[name] = value
+            elif len(self._lead_columns) < config.RESULTS_MAX_LEAD_COLUMNS:
+                self._lead_columns.add(name)
+                values[name] = value
+            else:
+                overflow[name] = value
+        if overflow:
+            values[OTHER_LEAD_FIELDS] = overflow
+        return values
 
     # ------------------------------------------------------------------ API
 
-    def append(self, row: Dict[str, Any]) -> None:
-        """Add one result under today's date (newest day block is at the top)."""
-        self._ensure_columns(list(row.keys()))
-        day = _day_of(row.get("processed_at")) or datetime.now().strftime("%Y-%m-%d")
-
-        if day != self._current_day:
-            top_is_today = (
-                self.ws.max_row >= 2
-                and self._is_date_row(2)
-                and self.ws.cell(row=2, column=1).value == day
-            )
-            if top_is_today:
-                # Continue today's block: next free row is just above the next date row
-                r = 3
-                while r <= self.ws.max_row and not self._is_date_row(r):
-                    r += 1
-                self._next_row = r
-            else:
-                # New day: put its date row directly under the header
-                self.ws.insert_rows(2)
-                self._write_date_row(2, day)
-                self._next_row = 3
-            self._current_day = day
-
-        if self._next_row <= self.ws.max_row:
-            self.ws.insert_rows(self._next_row)
-        self._write_data_row(self._next_row, [_cell(row.get(name)) for name in self.columns])
-        self._next_row += 1
+    def append(self, row: Dict[str, Any], lead: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Add one result under today's date (newest day block is at the top).
+        `row` holds this program's columns; `lead` holds the original lead fields.
+        """
+        if lead:
+            row = {**row, **self._lead_values(row, lead)}
+        existing = set(self.columns)
+        for name in row.keys():
+            if name not in existing:
+                self.columns.append(name)
+                existing.add(name)
+        day = _day_of(row.get(self._time_col)) or datetime.now().strftime("%Y-%m-%d")
+        stored = {k: _cell(v) for k, v in row.items()}
+        self._groups.setdefault(day, []).append(stored)
         self._dirty = True
 
+    @staticmethod
+    def _unlink_quietly(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def save(self) -> bool:
-        """Write the file. Returns False if it is locked (e.g. open in Excel)."""
+        """Write the file atomically. Returns False if it is locked (e.g. open in Excel)."""
         if not self._dirty:
             return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._rebuild_sheet()
+        tmp_path = self.path.with_name(f".{self.path.stem}.{os.getpid()}.tmp{self.path.suffix}")
         try:
-            self.wb.save(self.path)
+            self.wb.save(tmp_path)
+            os.replace(tmp_path, self.path)
             self._dirty = False
             return True
         except PermissionError:
+            self._unlink_quietly(tmp_path)
             return False
+        except Exception:
+            self._unlink_quietly(tmp_path)
+            raise

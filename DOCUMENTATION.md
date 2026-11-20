@@ -75,8 +75,13 @@ Campaigns appear on the Dograh dashboard under **Campaigns**.
 ```
 dograh_caller/
 ├── main.py              Command-line entry point (reads .xlsx / .csv / .json)
+├── pull_leads.py        Pulls 300-lead batches from the lead streamer; asks before every next ping
+├── install.sh           Server setup: .venv, requirements, `pull_leads.py --check`
+├── GO_LIVE.md           Steps to put https://ai-sdr.grobots.ai live (streamer, nginx, DNS, certbot)
+├── requirements-dev.txt Test dependencies (pytest, psycopg for the streamer tests)
 ├── pipeline.py          LeadPipeline: queues, workers, logging, summary
-├── number_verifier.py   Stage 1 – phone validation (US only)
+├── lead_fields.py       Reading unstructured leads (field-name words, nesting, JSON text)
+├── number_verifier.py   Stage 1 – phone validation (US only, never fax)
 ├── decision_maker.py    Stage 2 – Jev questions, service loading
 ├── campaign_manager.py  Stage 3 – one campaign per service: create, start, follow calls
 ├── dograh_client.py     Dograh HTTP client (agents, CSV upload, campaigns, runs)
@@ -86,7 +91,10 @@ dograh_caller/
 ├── requirements.txt
 ├── README.md            Quick start
 ├── SERVICES.md          How to write service descriptions
+├── ADDING_A_SERVICE.md  Step-by-step guide to adding a service
 ├── DOCUMENTATION.md     This file
+├── lead_streamer/       Standalone PostgreSQL HTTP lead streamer service
+├── tests/               Offline pytest test suite
 ├── examples/
 │   ├── from_python.py   Feeding dicts from Python code (scraper integration)
 │   └── sample_leads.xlsx  Test leads with fictional 555-01xx numbers
@@ -107,7 +115,7 @@ dograh_caller/
 ### `.env`
 
 Settings are read from, in priority order: real environment variables →
-`dograh_caller/.env` → `Task10/.env` (parent folder).
+`dograh_caller/.env` → `../.env` (parent folder).
 
 ```ini
 # Required
@@ -122,6 +130,8 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 |---|---|---|
 | `Jev_Key` / `TYPESAFE_API_KEY` | — | Jev API key (required) |
 | `JEV_MODEL` | `jev-1.14.0` | Jev model; pinned so behaviour doesn't change silently (`jev-latest` moves) |
+| `JEV_MAX_FIELD_CHARS` | `2000` | Longest value Jev gets from one field (longer text is cut) |
+| `JEV_MAX_STATE_CHARS` | `12000` | Most characters Jev gets per lead in total (most useful fields first) |
 | `INTEREST_THRESHOLD` | `0.85` | Minimum probability for a lead to be called |
 | `ALLOWED_PHONE_REGIONS` | `US` | Phone regions accepted, comma-separated ISO codes. `US,PR,VI,GU,MP,AS` adds the US territories |
 | `SKIP_ALREADY_CALLED` | `true` | Block numbers already called in earlier runs (read from the results sheet) |
@@ -140,9 +150,16 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 | `RESULT_WAIT_SECONDS` | `20` | After a call ends, wait this long for Dograh to fill in the outcome |
 | `RETRY_GRACE_SECONDS` | `120` | Extra wait beyond the retry delay for a retry call to appear |
 | `DECISION_CONCURRENCY` | `8` | Parallel Jev requests |
-| `LEAD_BATCH_SIZE` | `1000` | Leads per batch; each batch is scored, put into campaigns and fully called before the next |
+| `LEAD_BATCH_SIZE` | `300` | Leads per batch; each batch is scored, put into campaigns and fully called before the next. Keep equal to the streamer's `BATCH_SIZE` |
 | `QUEUE_MAXSIZE` | `100` | Max leads waiting between two stages |
 | `RESULTS_FILE` | `output/call_results.xlsx` | Results spreadsheet |
+| `TRANSFERS_FILE` | `output/transferred_calls.xlsx` | Only businesses whose call was transferred, with their details |
+| `TRANSFER_DISPOSITIONS` | `transfer_call,call_transferred` | Dispositions/tags that mean "transferred" (Dograh's defaults). Add the disposition you set on a transfer tool if it doesn't contain "transfer". Anything containing "transfer" but not "fail" also counts |
+| `LEAD_SOURCE_URL` | `https://ai-sdr.grobots.ai` | Lead streamer address pinged by `pull_leads.py` (`<url>/leads/next`) |
+| `LEAD_SOURCE_TOKEN` | — | The streamer's `STREAM_TOKEN` (alias `STREAM_TOKEN`); required by `pull_leads.py` |
+| `LEAD_SOURCE_TIMEOUT` | `180` | Seconds to wait for a ping's answer (minimum 120) |
+| `PULLED_BATCHES_DIR` | `output/pulled_batches` | Received batches (`.pending.json` until fully processed, then `.done.json`) |
+| `RESULTS_MAX_LEAD_COLUMNS` | `80` | Most lead fields with their own column; further fields go (as JSON) into `other_lead_fields` |
 
 ---
 
@@ -155,7 +172,7 @@ Every run is **live**: leads that pass the threshold are called.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `INPUT_FILE_PATH` | `examples\sample_leads.xlsx` | Leads file (.xlsx / .csv / .json). Relative paths are relative to `dograh_caller/`. `None` = no file. |
+| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json). Relative paths are relative to `dograh_caller/`. Empty by default on purpose: every run is live, so with no input set `python main.py` stops with "No input set" before contacting Jev or Dograh. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
 | `INPUT_SHEET` | `None` | Worksheet to read (`None` = first sheet) |
 | `INPUT_LEADS` | `[]` | Lead dicts, e.g. from the scraper. Processed together with the file if both are set. |
 | `LIMIT` | `None` | Process only the first N leads |
@@ -208,15 +225,15 @@ Any columns are allowed; one must contain the phone number (see §6).
 Done. Leads received: 10 | dropped by verifier: 4 | not interested: 2 | called: 4 | ...
 ```
 
-**Batches.** Leads are processed **1,000 at a time** (`LEAD_BATCH_SIZE`): the
+**Batches.** Leads are processed **300 at a time** (`LEAD_BATCH_SIZE`): the
 batch is verified and scored, one campaign per service is created for it, and
-every call finishes before the next 1,000 are taken:
+every call finishes before the next 300 are taken:
 
 ```
-[batch]    Batch 1: leads 1-1000 of 2500
+[batch]    Batch 1: leads 1-300 of 700
 ...        (verify, score, campaigns, calls)
 [campaign] 'Draftliner_2026-11-19' (campaign 21) finished - paused
-[batch]    Batch 2: leads 1001-2000 of 2500
+[batch]    Batch 2: leads 301-600 of 700
 ```
 
 `Ctrl+C` stops immediately: this run's campaigns are **paused** in Dograh,
@@ -226,15 +243,36 @@ rows already written are kept, and leads in progress are lost.
 
 ## 6. Stage 1 — Number verifier
 
-File: [number_verifier.py](number_verifier.py) · Class: `NumberVerifier`
+File: [number_verifier.py](number_verifier.py) · Class: `NumberVerifier` ·
+helpers for unstructured data: [lead_fields.py](lead_fields.py)
 
-**Finding the phone fields.** **Every** field whose name looks like a phone
-field is examined. Matching ignores case and all symbols, so `Phone(s)`,
-`Phone Number`, `phone_number`, `PHONE-NO`, `Mobile`, `Cell`, `Telephone`,
-`Tel`, `Contact Number`, `Business Phone`, `Number` and any name containing
-"phone" all count. Fields like `Phone Verified: Yes` or `Phone Type: Office`
-simply contain no number, so they don't hide the real phone column; if the
-`Phone` column is junk but `Mobile` holds a good number, `Mobile` is used.
+**Unstructured leads.** Leads may have any field names, any nesting (dicts in
+dicts, lists of dicts) and JSON stored as text. Nothing depends on fixed names:
+field names are split into words (`faxNumber` → *fax, number*, `Phone(s)` →
+*phone*) and nested values are walked to any depth.
+
+**Finding the phone fields.** A value is a phone value when its field name, or
+the name of any field it is nested under, is phone-like: `Phone(s)`,
+`Phone Number`, `phoneNumber`, `PHONE-NO`, `Mobile`, `mobileNo`, `Cell`,
+`Telephone`, `Tel`, `Contact No`, `contact_numbers`, `Number`, any name with the
+word "phone"; also `contact > phone`, `phones[] > number`, and entries labelled
+as a phone line (`{"label": "Main", "value": "512-555-0101"}`). Fields like
+`Phone Verified: Yes` simply contain no number; if the `Phone` field is junk but
+`Mobile` holds a good number, `Mobile` is used. Numbers that only appear in
+free text (e.g. a description) are not used.
+
+**Fax numbers are never called.** A number is a fax number when:
+
+| How it's marked | Examples |
+|---|---|
+| Its field name says fax | `fax`, `Fax No.`, `fax_phone`, `faxNumber`, `telefax`, `contact > fax` |
+| Its entry is typed as fax | `{"type": "fax", "number": "..."}`, `{"label": "Fax", "value": "..."}`, `{"category": "fax", ...}` — any nested entry, whatever its size (entries with ids, sources, dates, flags included). The lead's own top-level `type` / `category` never counts. |
+| Its label in the text says fax | `Fax: 512…`, `F: 512…`, `512… (fax)`, `512… fax, 713…`, `Tel/Fax: 512…` (shared line → not called) |
+
+Every fax number found anywhere in the lead is excluded, **even if the same
+number is also listed in a phone field** (e.g. a fax number that sits in the
+`phones` list). "Fairfax" or "fax machines" in other text are not fax labels.
+A lead whose only numbers are fax numbers → `dropped_fax_only`.
 
 **Reading numbers.** Numbers are found inside each value with libphonenumber's
 number finder, so all of these work: `+19292659900, +19174102250`,
@@ -250,6 +288,7 @@ Numbers without a `+country` prefix are read as US numbers.
 |---|---|
 | A phone field exists | `dropped_no_phone` |
 | A number can be read | `dropped_unreadable_number` |
+| Not a fax number (see above) | `dropped_fax_only` |
 | Valid for the numbering plan (real area code, length, ...) | `dropped_invalid_number` |
 | Region allowed — default **US only** (Canada, Puerto Rico, Guam, Caribbean... excluded; see `ALLOWED_PHONE_REGIONS`) | `dropped_not_us (<REGION>)` |
 | Callable type: landline, mobile or toll-free. Premium-rate (900), shared-cost, personal (500-type), pager and other special numbers are dropped | `dropped_special_number (<TYPE>)` |
@@ -269,7 +308,7 @@ have no location and are left blank.
 - The **first** number that passes all checks is called (normalized to E.164,
   `+1XXXXXXXXXX`).
 - If several numbers fail for different reasons, the most informative reason
-  is reported (not-US > special > invalid > unreadable).
+  is reported (not-US > fax-only > special > invalid > unreadable).
 - **Duplicates:** if *any* good number of a lead was seen before in this run,
   the lead is the same business again and is dropped — a business is never
   called twice, even when it is listed with a different number first.
@@ -286,9 +325,27 @@ File: [decision_maker.py](decision_maker.py) · Class: `DecisionMaker`
 
 ### What Jev sees
 
-- **State:** the lead dict **without** phone fields and empty values, e.g.
-  `{"company": "...", "category": "...", "description": "...", "location": "..."}`.
-- **Questions:** one `Noul` (yes/no) question per enabled service:
+**State:** only the information that describes the business, built by
+`lead_state()` from the unstructured lead:
+
+| Kept (most useful first) | Removed |
+|---|---|
+| 1. Business name, opportunity title | Phone, fax and e-mail fields |
+| 2. Category, industry, trade, services, type | Links: website, URLs, domain, social profiles |
+| 3. Descriptions, notes, about, summary | IDs, versions, `event`, created / updated / seen dates, timestamps |
+| 4. Size, employees, years, licenses, rating | Status, activity, follow-up, source, retry and other bookkeeping |
+| 5. City, state, country, markets served | People's names (contact / owner names); job titles are kept |
+| 6. Anything else descriptive | Placeholders (`n/a`, `Not specified`, `Unassigned`, `-`), values that look like phone numbers, URLs, e-mails or dates |
+
+- Nested fields are flattened to `parent > child` (e.g. `business > about`);
+  repeated fields from lists are joined with `;`.
+- Each value is cut to `JEV_MAX_FIELD_CHARS` (2,000) and the whole state to
+  `JEV_MAX_STATE_CHARS` (12,000), filling in the order above — so a 40,000-
+  character tender description can't crowd out the rest or exceed Jev's limits.
+- Example: a 41,000-character streamer lead becomes ~2,500 characters of
+  company, category, services, description (capped), size and location.
+
+**Questions:** one `Noul` (yes/no) question per enabled service:
   - *instructions:* "Decide whether [the lead] is realistically a potential
     customer that would be interested in `<name>`'s services…" + the service's
     `description`;
@@ -373,9 +430,10 @@ All requests send header `X-API-Key: <DOGRAH_API_KEY>`.
   and the retry window (`retry_delay` + `RETRY_GRACE_SECONDS`) still open.
 - The result row records the **last** attempt (`dograh_run_id`) and the number
   of attempts (`call_attempts`).
-- If the campaign reaches `completed`/`failed`, leads never dialed become
-  `call_failed`. If the campaign makes no progress for
-  `CAMPAIGN_IDLE_TIMEOUT_SECONDS`, unfinished leads become `call_timeout`.
+- If the campaign reaches a final state (`completed`/`failed`/`paused`/`cancelled`/`stopped`),
+  leads never dialed become `call_failed`. If all active campaigns make no progress
+  for `CAMPAIGN_IDLE_TIMEOUT_SECONDS`, dialed unfinished leads become `call_timeout`
+  while never-dialed leads become `call_failed` (so later runs can still dial them).
 - Before creating a campaign, the agent's **published** prompts are scanned for
   `{{variables}}` (same rules as Dograh). Dograh refuses a whole campaign if any
   row lacks one of them, so leads without such a value are left out and recorded
@@ -447,7 +505,16 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
   new day's block on top, while the run keeps using the same campaigns.
   The day comes from `processed_at` (local time). Files written in an older
   layout are regrouped into this layout when opened.
-- New lead fields or new services add new columns automatically.
+- New services add `prob_<id>` columns automatically. Lead fields get their
+  own columns too, up to `RESULTS_MAX_LEAD_COLUMNS` (80) — leads are
+  unstructured, so without a limit every new field name would widen the sheet.
+  Fields beyond the limit are kept, as JSON, in the `other_lead_fields` column.
+- Nested lead values (dicts, lists) are stored as JSON in one cell.
+- **A lead field never overwrites anything.** If its name is one of this
+  program's columns (e.g. the scraper's own `status`, `detail`), it is stored
+  as `lead.<name>` — always the same column, so the scraper's `status` is
+  always in `lead.status` and our `status` stays ours. The lead's other fields
+  (e.g. its `lead_status`) are untouched.
 - Saving is batched: the file is written whenever the queue of pending rows is empty.
 - If the file is open in Excel (locked), the pipeline warns and keeps retrying;
   at shutdown it retries for 60 s and then saves a timestamped copy
@@ -470,21 +537,23 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | `dograh_run_id` | Run ID of the last call attempt (look it up under *Agent Runs*) |
 | `call_attempts` | Number of call attempts including Dograh retries |
 | `call_disposition`, `call_duration_s`, `call_tags` | Call outcome |
+| `call_transferred` | TRUE when the agent transferred the call; the business is also in `TRANSFERS_FILE` |
 | `transcript_url`, `recording_url` | Call artifacts |
 | `dograh_response` | Full Dograh run as JSON (cut at Excel's 32k-character cell limit) |
 | `prob_<service_id>` | Jev probability for each service |
-| *lead fields* | Original fields; renamed `lead_<name>` if they clash with a column above |
+| `other_lead_fields` | Lead fields beyond the column limit (JSON) |
+| *lead fields* | Original fields; stored as `lead.<name>` if the name is one of the columns above |
 
 ### Status values
 
 | Status | Meaning |
 |---|---|
-| `dropped_no_phone` / `dropped_unreadable_number` / `dropped_invalid_number` / `dropped_not_us (XX)` / `dropped_special_number (TYPE)` / `dropped_already_called` / `dropped_duplicate` | Rejected by the verifier (§6) |
+| `dropped_no_phone` / `dropped_unreadable_number` / `dropped_invalid_number` / `dropped_not_us (XX)` / `dropped_special_number (TYPE)` / `dropped_fax_only` / `dropped_already_called` / `dropped_duplicate` | Rejected by the verifier (§6) |
 | `not_interested` | No service reached the threshold |
 | `called` | Call completed; see disposition |
 | `skipped_missing_data` | Left out of its campaign because it has no value for a `{{variable}}` the agent's prompt uses (Dograh would otherwise refuse the whole campaign) |
-| `call_failed` | Campaign couldn't be created/started, the number was never dialed, or Dograh couldn't be reached |
-| `call_timeout` | Campaign made no progress for `CAMPAIGN_IDLE_TIMEOUT_SECONDS` |
+| `call_failed` | Campaign couldn't be created/started, the number was never dialed (including before an idle timeout), or Dograh couldn't be reached |
+| `call_timeout` | A dialed call never finished before `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without campaign progress |
 | `decision_error` | Jev request failed (network, key, rate limit after retries) |
 | `error` | Unexpected error in the verifier |
 
@@ -555,6 +624,30 @@ run_leads_sync(leads, **pipeline_kwargs)    # blocking version for normal script
 
 ### Scraper integration
 
+**Lead streamer (live setup).** `python pull_leads.py` pings
+`GET https://ai-sdr.grobots.ai/leads/next` (`Authorization: Bearer <LEAD_SOURCE_TOKEN>`),
+gets one batch of up to 300 leads, saves it to `PULLED_BATCHES_DIR`, runs it
+through `run_leads()` until every call is finished, and then waits for a person
+(Enter = next ping, `q` = quit). It never pings again without that input.
+
+| Streamer answer | What `pull_leads.py` does |
+|---|---|
+| `200 "ok"` + leads | save → process fully → ask |
+| `200 "no_new_leads"` | say so → ask |
+| `503` busy / database down | show `retry_after_seconds` → ask |
+| `404`, an HTML page, network error, timeout | explain → ask |
+| `401` token / `421` host | stop (exit code 2): configuration problem |
+
+Before the first ping it checks the Jev key, `services.yaml` and each Dograh
+agent, so no leads are taken while the caller can't use them. `python pull_leads.py --check` runs
+the same checks plus the streamer's `/health` and `/stats` (token) and exits
+without taking any leads. SIGTERM and SIGHUP (kill, a dropped SSH session) are
+handled like Ctrl+C: campaigns are paused and the batch is kept. An interrupted batch
+(`*.pending.json`) is offered again at the next start. The streamer's side of
+this agreement is in [lead_streamer/LEAD_STREAMER_SPEC.md](lead_streamer/LEAD_STREAMER_SPEC.md) §7, §12, §16.
+
+**In-process.**
+
 The scraper only needs to produce dicts with a phone field and descriptive
 fields (company, category, description, location, …) and call
 `pipeline.submit(lead)`. Example: [examples/from_python.py](examples/from_python.py).
@@ -596,9 +689,9 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 | Allow more simultaneous calls | Raise the Dograh organization's concurrent-call limit. |
 | Change retries | `CAMPAIGN_MAX_RETRIES`, `CAMPAIGN_RETRY_*` in `.env`. |
 | Change campaign naming | `CAMPAIGN_NAME_DATE_FORMAT`, or `campaign_name()` in [campaign_manager.py](campaign_manager.py). |
-| Accept other countries | Change the region check in `NumberVerifier.verify()`. |
+| Accept other countries | Set `ALLOWED_PHONE_REGIONS` in `.env` (comma-separated ISO codes, e.g. `US,CA`). |
 | Add another input format | Add a branch to `read_leads()` in [main.py](main.py). |
-| Store results elsewhere | Replace `ResultsStore` (it only needs `append(row)` and `save()`). |
+| Store results elsewhere | Replace `ResultsStore` (it only needs `append(row, lead)`, `save()`, and `.path`). |
 
 ---
 
@@ -615,7 +708,7 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 | Many `decision_error` rows | Jev rate limit or network issue; lower `DECISION_CONCURRENCY`. |
 | `FAILED to start '<service>_<date>'` | Dograh refused the campaign; the message says why (telephony not configured, quota, invalid CSV, ...). |
 | Leads marked `skipped_missing_data` | The agent's prompt uses a `{{variable}}` those leads have no value for. Add the field to the leads, give the variable a default in the prompt (`{{company | there}}`), or remove it. |
-| Calls stay on "Calling…" for a long time | Normal while the conversation lasts. If calls never finish, Dograh is not receiving the telephony provider's status callbacks — check the deployment's public backend URL. Unfinished leads end as `call_timeout` after `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without progress. |
+| Calls stay on "Calling…" for a long time | Normal while the conversation lasts. If calls never finish, Dograh is not receiving the telephony provider's status callbacks — check the deployment's public backend URL. Unfinished dialed leads end as `call_timeout` (and undialed leads as `call_failed`) after `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without progress. |
 | Long pauses between calls | One concurrent-call slot shared by all campaigns, plus retry delays. |
 | A lead waits ~4 min after "no-answer" | It is waiting for Dograh's retry (`CAMPAIGN_RETRY_DELAY_SECONDS` + `RETRY_GRACE_SECONDS`). |
 | `results ... is open in another program` | Close the spreadsheet in Excel. |
@@ -625,8 +718,11 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 ## 14. Limitations and known behaviour
 
-- **In-memory only.** No recovery after a crash; duplicates are only detected
-  within one run (a lead in an earlier run's sheet can be called again).
+- **In-memory queues.** In-flight queues are not persisted across crashes, though
+  already-written results are saved atomically to the spreadsheet and cross-run
+  repeat calls are blocked when `SKIP_ALREADY_CALLED=true` (reading `call_results.xlsx`
+  and any timestamped fallback copies). Within a single run, `self._seen` also prevents
+  calling or re-scoring the same number twice.
 - **Campaigns are created after scoring.** Dograh can't add numbers to an
   existing campaign, so campaigns are created when the input ends (or on
   `flush()`), not at the start of the run. Services with no interested leads

@@ -38,8 +38,10 @@ from pipeline import run_leads_sync
 # ==============================================================================
 
 # Path to a leads file: .xlsx (first row = column names), .csv or .json.
-# Relative paths are relative to this folder. Set to None to use only INPUT_LEADS.
-INPUT_FILE_PATH: Optional[str] = r"C:\Users\adil.zia\Desktop\Tasks\Task10\dograh_caller\examples\datapoints.xlsx"
+# Relative paths are relative to this folder. None = no file (use INPUT_LEADS).
+# Left empty on purpose: every run is LIVE, so the program only calls leads you
+# point it at. Don't use examples/sample_leads.xlsx here - its numbers are fictional.
+INPUT_FILE_PATH: Optional[str] = None
 
 # Worksheet to read from INPUT_FILE_PATH (None = first sheet).
 INPUT_SHEET: Optional[str] = None
@@ -102,8 +104,12 @@ def read_leads(path: Union[str, Path], sheet: Optional[str] = None) -> List[Dict
             wb.close()
     if ext == ".csv":
         with open(path, newline="", encoding="utf-8-sig") as f:
-            return [{k.strip(): v.strip() for k, v in row.items() if k and v and v.strip()}
-                    for row in csv.DictReader(f)]
+            leads = []
+            for row in csv.DictReader(f):
+                lead = {k.strip(): v.strip() for k, v in row.items() if k and v and v.strip()}
+                if lead:
+                    leads.append(lead)
+            return leads
     if ext == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -147,7 +153,10 @@ def run(
     except Exception as e:
         print(f"Could not load leads: {e}")
         return 1
-    if limit:
+    if limit is not None:
+        if limit <= 0:
+            print("Limit must be a positive integer.")
+            return 1
         leads = leads[:limit]
     if not leads:
         print("No leads to process.")
@@ -187,10 +196,15 @@ def main() -> int:
         print(f"Could not load leads: {e}")
         return 1
     if not leads:
-        print("No leads given. Set INPUT_FILE_PATH or INPUT_LEADS at the top of main.py.")
+        if not args.input and INPUT_FILE_PATH is None and not INPUT_LEADS:
+            print("No input set. Set INPUT_FILE_PATH (or INPUT_LEADS) at the top of main.py,\n"
+                  "or run: python main.py path\\to\\leads.xlsx")
+        else:
+            print("No leads found in the input.")
         return 1
 
-    return run(leads, limit=args.limit or LIMIT,
+    limit = args.limit if args.limit is not None else LIMIT
+    return run(leads, limit=limit,
                threshold=args.threshold, output=args.output)
 
 

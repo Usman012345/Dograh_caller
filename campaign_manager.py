@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import config
@@ -26,7 +26,7 @@ RETRYABLE = {
     "retry_on_no_answer": {"no-answer", "no_answer"},
     "retry_on_voicemail": {"voicemail", "machine"},
 }
-FINAL_CAMPAIGN_STATES = {"completed", "failed"}
+FINAL_CAMPAIGN_STATES = {"completed", "failed", "paused", "cancelled", "canceled", "stopped"}
 
 
 @dataclass
@@ -45,9 +45,12 @@ def _ts(value: Any) -> Optional[float]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 class CampaignJob:
@@ -96,6 +99,7 @@ class CampaignJob:
         client: DograhClient,
         on_call_started: Callable[[CampaignLead, Dict[str, Any], int], None],
         on_result: Callable[[CampaignLead, CallOutcome], None],
+        progress_clock: Optional[List[float]] = None,
     ) -> None:
         """Follow the campaign until every lead has a final outcome."""
         assert self.campaign_id is not None
@@ -105,10 +109,20 @@ class CampaignJob:
         finished: Set[str] = set()
         completed_at: Dict[Any, float] = {}
         last_progress = time.monotonic()
+        if progress_clock is not None:
+            progress_clock[0] = max(progress_clock[0], last_progress)
         errors = 0
+
+        def touch_progress(ts: float) -> None:
+            nonlocal last_progress
+            if ts > last_progress:
+                last_progress = ts
+            if progress_clock is not None and ts > progress_clock[0]:
+                progress_clock[0] = ts
 
         def finish(cl: CampaignLead, outcome: CallOutcome) -> None:
             finished.add(cl.ref)
+            touch_progress(time.monotonic())
             on_result(cl, outcome)
 
         while True:
@@ -137,7 +151,7 @@ class CampaignJob:
                 attempts.setdefault(cl.ref, []).append(run)
                 if run.get("id") not in announced:
                     announced.add(run.get("id"))
-                    last_progress = time.monotonic()
+                    touch_progress(time.monotonic())
                     on_call_started(cl, run, len(attempts[cl.ref]))
 
             now = time.monotonic()
@@ -149,13 +163,15 @@ class CampaignJob:
                 latest = tries[-1]
                 if not latest.get("is_completed"):
                     continue
-                completed_at.setdefault(latest.get("id"), now)
+                run_key = latest.get("id") if latest.get("id") is not None else (cl.ref, len(tries))
+                if run_key not in completed_at:
+                    completed_at[run_key] = now
+                    touch_progress(now)
                 # Dograh may write the outcome a moment after the call ends
-                if not run_disposition(latest) and now - completed_at[latest.get("id")] < config.RESULT_WAIT_SECONDS:
+                if not run_disposition(latest) and now - completed_at[run_key] < config.RESULT_WAIT_SECONDS:
                     continue
-                if self._retry_pending(latest, len(tries), retry_cfg):
+                if self._retry_pending(latest, len(tries), retry_cfg, completed_mono=completed_at[run_key]):
                     continue
-                last_progress = now
                 finish(cl, outcome_from_run(latest, attempts=len(tries)))
 
             if len(finished) == len(self.leads):
@@ -177,20 +193,32 @@ class CampaignJob:
                 if len(finished) == len(self.leads):
                     return
 
-            if time.monotonic() - last_progress > config.CAMPAIGN_IDLE_TIMEOUT_SECONDS:
+            idle_since = progress_clock[0] if progress_clock is not None else last_progress
+            if time.monotonic() - idle_since > config.CAMPAIGN_IDLE_TIMEOUT_SECONDS:
                 for cl in self.leads:
                     if cl.ref not in finished:
                         tries = attempts.get(cl.ref) or []
-                        outcome = (outcome_from_run(tries[-1], attempts=len(tries)) if tries
-                                   else CallOutcome(status="call_timeout"))
-                        outcome.status = "call_timeout"
-                        outcome.error = (f"No progress in campaign for {config.CAMPAIGN_IDLE_TIMEOUT_SECONDS}s "
-                                         f"(state '{state}')")
+                        if tries:
+                            outcome = outcome_from_run(tries[-1], attempts=len(tries))
+                            outcome.status = "call_timeout"
+                            outcome.error = (f"No progress in campaign for {config.CAMPAIGN_IDLE_TIMEOUT_SECONDS}s "
+                                             f"(state '{state}')")
+                        else:
+                            outcome = CallOutcome(
+                                status="call_failed",
+                                error=(f"Not dialed: no progress in campaign for "
+                                       f"{config.CAMPAIGN_IDLE_TIMEOUT_SECONDS}s (state '{state}')"),
+                            )
                         finish(cl, outcome)
                 return
 
     @staticmethod
-    def _retry_pending(latest: Dict[str, Any], attempts: int, retry_cfg: Dict[str, Any]) -> bool:
+    def _retry_pending(
+        latest: Dict[str, Any],
+        attempts: int,
+        retry_cfg: Dict[str, Any],
+        completed_mono: Optional[float] = None,
+    ) -> bool:
         """True if Dograh is expected to call this lead again."""
         if not retry_cfg.get("enabled"):
             return False
@@ -202,8 +230,10 @@ class CampaignJob:
             return False
         if attempts > int(retry_cfg.get("max_retries") or 0):
             return False
-        started = _ts(latest.get("created_at"))
-        if started is None:
-            return True
         window = int(retry_cfg.get("retry_delay_seconds") or 0) + config.RETRY_GRACE_SECONDS
-        return time.time() < started + window
+        if completed_mono is not None:
+            return time.monotonic() < completed_mono + window
+        ref_ts = _ts(latest.get("updated_at")) or _ts(latest.get("created_at"))
+        if ref_ts is None:
+            return False
+        return time.time() < ref_ts + window

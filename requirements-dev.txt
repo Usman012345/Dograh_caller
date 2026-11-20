@@ -1,0 +1,5 @@
+# For running the tests: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.0
+# The lead_streamer tests import the streamer, which uses psycopg
+psycopg[binary]>=3.1

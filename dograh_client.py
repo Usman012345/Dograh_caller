@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -68,16 +69,29 @@ class DograhClient:
         if not api_key:
             raise ValueError("Dograh API key not found. Put it in .env as DOGRAH_API_KEY=...")
         self.base_url = base_url.rstrip("/")
-        self._session = requests.Session()
-        self._session.headers.update({"X-API-Key": api_key, "Accept": "application/json"})
+        self._api_key = api_key
+        self._local = threading.local()
+        self._sessions_lock = threading.Lock()
+        self._sessions: List[requests.Session] = []
+        self._agents_lock = threading.Lock()
         self._agents: Dict[int, Agent] = {}
 
     # -- low level -------------------------------------------------------------
 
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"X-API-Key": self._api_key, "Accept": "application/json"})
+            self._local.session = session
+            with self._sessions_lock:
+                self._sessions.append(session)
+        return session
+
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
         try:
-            return self._session.request(
+            return self._get_session().request(
                 method, url, timeout=config.REQUEST_TIMEOUT, verify=config.VERIFY_SSL, **kwargs
             )
         except requests.RequestException as e:
@@ -97,8 +111,9 @@ class DograhClient:
 
     def get_agent(self, agent_id: int) -> Agent:
         """Look up an agent (workflow) by its numeric ID. Cached."""
-        if agent_id in self._agents:
-            return self._agents[agent_id]
+        with self._agents_lock:
+            if agent_id in self._agents:
+                return self._agents[agent_id]
         resp = self._request("GET", f"/workflow/fetch/{agent_id}")
         if resp.status_code == 404:
             raise DograhError(f"Dograh agent {agent_id} does not exist.")
@@ -108,7 +123,8 @@ class DograhClient:
             name=str(data.get("name") or f"Agent {agent_id}"),
             version_status=str(data.get("version_status") or ""),
         )
-        self._agents[agent_id] = agent
+        with self._agents_lock:
+            self._agents[agent_id] = agent
         return agent
 
     def get_required_variables(self, agent_id: int) -> Set[str]:
@@ -215,7 +231,11 @@ class DograhClient:
             page += 1
 
     def close(self) -> None:
-        self._session.close()
+        with self._sessions_lock:
+            sessions, self._sessions = self._sessions, []
+        for session in sessions:
+            session.close()
+        self._local = threading.local()
 
 
 # ------------------------------------------------------------------------------
@@ -254,6 +274,29 @@ def run_disposition(run: Dict[str, Any]) -> Optional[str]:
         if g.get(key):
             return str(g[key])
     return None
+
+
+def is_transferred(run: Dict[str, Any]) -> bool:
+    """
+    True if the agent transferred this call. Dograh marks it in gathered_context:
+    disposition "transfer_call" (phone transfer) or "call_transferred" (PBX
+    transfer, also external_pbx_transferred=True), or a disposition configured on
+    the transfer tool (see config.TRANSFER_DISPOSITIONS). A failed transfer is
+    not a transfer.
+    """
+    g = run.get("gathered_context") or {}
+    if g.get("external_pbx_transferred") is True or str(g.get("transfer_state") or "").lower() == "complete":
+        return True
+    tags = g.get("call_tags") or []
+    values = [g.get("call_disposition"), g.get("mapped_call_disposition"),
+              *(tags if isinstance(tags, list) else [tags])]
+    for value in values:
+        v = str(value or "").strip().lower()
+        if not v or "fail" in v:
+            continue
+        if v in config.TRANSFER_DISPOSITIONS or "transfer" in v:
+            return True
+    return False
 
 
 def outcome_from_run(run: Dict[str, Any], attempts: int = 1) -> CallOutcome:
