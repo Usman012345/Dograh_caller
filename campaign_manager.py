@@ -10,16 +10,28 @@ retries) are followed until every lead has a final outcome.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import config
 from decision_maker import Service
 from dograh_client import (
-    Agent, CallOutcome, DograhClient, DograhError, call_context, outcome_from_run, run_disposition,
+    Agent,
+    CallOutcome,
+    DograhClient,
+    DograhError,
+    call_context,
+    extract_pipeline_error,
+    is_transferred,
+    outcome_from_run,
+    run_disposition,
 )
+
+logger = logging.getLogger(__name__)
 
 RETRYABLE = {
     "retry_on_busy": {"busy"},
@@ -39,6 +51,11 @@ class CampaignLead:
 
 def campaign_name(service: Service, when: Optional[datetime] = None) -> str:
     return f"{service.name}_{(when or datetime.now()).strftime(config.CAMPAIGN_NAME_DATE_FORMAT)}"
+
+
+def _pipeline_error_signature(text: str) -> str:
+    normalized = re.sub(r"#\d+\b", "#", text.strip().lower())
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _ts(value: Any) -> Optional[float]:
@@ -109,10 +126,16 @@ class CampaignJob:
         announced: Set[Any] = set()
         finished: Set[str] = set()
         completed_at: Dict[Any, float] = {}
+        fetched_runs: Dict[Any, Dict[str, Any]] = {}
         last_progress = time.monotonic()
         if progress_clock is not None:
             progress_clock[0] = max(progress_clock[0], last_progress)
         errors = 0
+        error_limit = max(1, int(getattr(config, "CAMPAIGN_PIPELINE_ERROR_LIMIT", 3)))
+        last_error_sig: Optional[str] = None
+        consecutive_pipeline_errors = 0
+        last_pipeline_error = ""
+        circuit_broken_reason: Optional[str] = None
 
         def touch_progress(ts: float) -> None:
             nonlocal last_progress
@@ -125,6 +148,49 @@ class CampaignJob:
             finished.add(cl.ref)
             touch_progress(time.monotonic())
             on_result(cl, outcome)
+
+        async def resolve_outcome(
+            latest: Dict[str, Any],
+            attempts_count: int,
+            details: Dict[str, Any],
+        ) -> Tuple[CallOutcome, Optional[str]]:
+            run = latest
+            run_id = run.get("id")
+            if run_id is not None and run_id in fetched_runs:
+                run = fetched_runs[run_id]
+            elif run.get("logs") is None and not is_transferred(run):
+                prelim = outcome_from_run(run, attempts=attempts_count)
+                disp = (prelim.disposition or "").strip().lower()
+                needs_detail = (
+                    not disp
+                    or "fail" in disp
+                    or "hangup" in disp
+                    or "hung up" in disp
+                    or disp == "error"
+                    or (
+                        disp not in ("busy", "no-answer", "no_answer", "voicemail", "machine")
+                        and (prelim.duration_seconds is None or prelim.duration_seconds <= 30)
+                    )
+                )
+                get_wf_run = getattr(client, "get_workflow_run", None)
+                workflow_id = (
+                    run.get("workflow_id")
+                    or details.get("workflow_id")
+                    or getattr(self.agent, "id", None)
+                )
+                if needs_detail and callable(get_wf_run) and run_id is not None and workflow_id:
+                    try:
+                        detail_run = await asyncio.to_thread(get_wf_run, workflow_id, run_id)
+                        if isinstance(detail_run, dict):
+                            merged = {**run, **detail_run}
+                            if "initial_context" not in detail_run and "initial_context" in run:
+                                merged["initial_context"] = run["initial_context"]
+                            fetched_runs[run_id] = merged
+                            run = merged
+                    except Exception as exc:
+                        logger.debug("Could not fetch workflow %s run %s details: %s", workflow_id, run_id, exc)
+            outcome = outcome_from_run(run, attempts=attempts_count)
+            return outcome, extract_pipeline_error(run)
 
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -168,11 +234,13 @@ class CampaignJob:
                 attempts.setdefault(cl.ref, []).append(run)
                 if run.get("id") not in announced:
                     announced.add(run.get("id"))
-                    touch_progress(time.monotonic())
-                    on_call_started(cl, run, len(attempts[cl.ref]))
+                    if cl.ref not in finished:
+                        touch_progress(time.monotonic())
+                        on_call_started(cl, run, len(attempts[cl.ref]))
 
             now = time.monotonic()
             retry_cfg = details.get("retry_config") or {}
+            ready: List[Tuple[CampaignLead, List[Dict[str, Any]], Dict[str, Any]]] = []
             for cl in self.leads:
                 if cl.ref in finished or cl.ref not in attempts:
                     continue
@@ -189,7 +257,45 @@ class CampaignJob:
                     continue
                 if self._retry_pending(latest, len(tries), retry_cfg, completed_mono=completed_at[run_key]):
                     continue
-                finish(cl, outcome_from_run(latest, attempts=len(tries)))
+                ready.append((cl, tries, latest))
+
+            ready.sort(key=lambda item: item[2].get("id") or 0)
+            for cl, tries, latest in ready:
+                if cl.ref in finished:
+                    continue
+                outcome, pipe_err = await resolve_outcome(latest, len(tries), details)
+                finish(cl, outcome)
+
+                if outcome.status == "call_failed" and pipe_err:
+                    sig = _pipeline_error_signature(pipe_err)
+                    if sig == last_error_sig:
+                        consecutive_pipeline_errors += 1
+                    else:
+                        last_error_sig = sig
+                        consecutive_pipeline_errors = 1
+                        last_pipeline_error = pipe_err
+                    if circuit_broken_reason is None and consecutive_pipeline_errors >= error_limit:
+                        circuit_broken_reason = (
+                            f"Campaign paused after {consecutive_pipeline_errors} consecutive pipeline errors: "
+                            f"{last_pipeline_error}"
+                        )
+                        pause_fn = getattr(client, "pause_campaign", None) or getattr(client, "stop_campaign", None)
+                        if callable(pause_fn):
+                            try:
+                                await asyncio.to_thread(pause_fn, self.campaign_id)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to pause campaign %s after pipeline errors: %s",
+                                    self.campaign_id,
+                                    exc,
+                                )
+                        for rem in self.leads:
+                            if rem.ref not in finished and not attempts.get(rem.ref):
+                                finish(rem, CallOutcome(status="call_failed", error=circuit_broken_reason))
+                else:
+                    last_error_sig = None
+                    consecutive_pipeline_errors = 0
+                    last_pipeline_error = ""
 
             if len(finished) == len(self.leads):
                 return
@@ -203,10 +309,16 @@ class CampaignJob:
                     if tries and not tries[-1].get("is_completed"):
                         continue  # still on the phone; wait for it
                     if tries:
-                        finish(cl, outcome_from_run(tries[-1], attempts=len(tries)))
+                        outcome, _ = await resolve_outcome(tries[-1], len(tries), details)
+                        finish(cl, outcome)
                     else:
-                        finish(cl, CallOutcome(status="call_failed",
-                                               error=f"Not dialed: campaign ended in state '{state}'"))
+                        finish(
+                            cl,
+                            CallOutcome(
+                                status="call_failed",
+                                error=circuit_broken_reason or f"Not dialed: campaign ended in state '{state}'",
+                            ),
+                        )
                 if len(finished) == len(self.leads):
                     return
 

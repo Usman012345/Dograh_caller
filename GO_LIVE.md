@@ -3,12 +3,12 @@
 ```
  dograh caller (any machine)                    scraper server vmi3720154 (79.143.180.241)
  ───────────────────────────                    ─────────────────────────────────────────────────────
- python pull_leads.py                           nginx 1.24 (already there for scrapper.grobots.ai)
+ dashboard_server.py (or pull_leads.py)         nginx 1.24 (already there for scrapper.grobots.ai)
    GET https://ai-sdr.grobots.ai/leads/next ──►   + new site ai-sdr.grobots.ai, Let's Encrypt cert
    Authorization: Bearer <token>                    │ proxy_pass http://127.0.0.1:8090, Host passed on
                                                     ▼
    ◄── up to 300 leads ───────────────────────  lead-streamer.service (127.0.0.1:8090)
-   process all of them, then wait for Enter         │
+   only after Start Batch / Enter; stops when done  │
                                                     ▼
                                                 PostgreSQL "dataops" (container dataops_db, 127.0.0.1:5432)
 ```
@@ -103,12 +103,14 @@ streamer's `STREAM_TOKEN`):
 bash install.sh            # Windows: .venv\Scripts\python pull_leads.py --check
 ```
 
-**Check:** `All checks passed. Nothing was taken from the streamer.` Then start it:
+**Check:** `All checks passed. Nothing was taken from the streamer.` Then start the dashboard (stays idle until you click **Start Batch**):
 
 ```bash
 tmux new -s caller
-.venv/bin/python pull_leads.py
+.venv/bin/python dashboard_server.py
 ```
+
+(Or use `.venv/bin/python pull_leads.py` in the terminal — it waits for you to press **Enter** before every ping, including the first.)
 
 Results: `output/call_results.xlsx` (every lead) and `output/transferred_calls.xlsx`
 (only the businesses whose call was transferred, with their details).

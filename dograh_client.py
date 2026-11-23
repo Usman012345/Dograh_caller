@@ -9,6 +9,7 @@ Dograh client - HTTP calls to the Dograh API used by the campaign stage.
   POST /campaign/{id}/pause               -> stop dialing (when finished, or on exit)
   GET  /campaign/{id}                     -> state, retry config, counts
   GET  /campaign/{id}/runs                -> one run per call attempt
+  GET  /workflow/{workflow_id}/runs/{id}  -> single run details (with logs)
 
 Campaign contacts are fixed when the campaign is created (Dograh has no API
 to add numbers to an existing campaign).
@@ -23,7 +24,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -196,6 +197,13 @@ class DograhClient:
         if resp.status_code != 200:
             raise DograhError(f"Starting campaign {campaign_id} failed (HTTP {resp.status_code}): {_detail(resp)}")
 
+    def pause_campaign(self, campaign_id: int) -> str:
+        """Pause a campaign via POST /campaign/{id}/pause."""
+        resp = self._request("POST", f"/campaign/{campaign_id}/pause")
+        if resp.status_code != 200:
+            raise DograhError(f"Pausing campaign {campaign_id} failed (HTTP {resp.status_code}): {_detail(resp)}")
+        return "paused"
+
     def stop_campaign(self, campaign_id: int) -> str:
         """
         Make sure a campaign is no longer dialing. Dograh has no "complete" or
@@ -205,13 +213,17 @@ class DograhClient:
         state = str(self.get_campaign(campaign_id).get("state") or "").lower()
         if state not in ("running", "syncing"):
             return state
-        resp = self._request("POST", f"/campaign/{campaign_id}/pause")
-        if resp.status_code != 200:
-            raise DograhError(f"Pausing campaign {campaign_id} failed (HTTP {resp.status_code}): {_detail(resp)}")
-        return "paused"
+        return self.pause_campaign(campaign_id)
 
     def get_campaign(self, campaign_id: int) -> Dict[str, Any]:
         return self._json(self._request("GET", f"/campaign/{campaign_id}"), f"Fetching campaign {campaign_id}")
+
+    def get_workflow_run(self, workflow_id: int | str, run_id: int | str) -> Dict[str, Any]:
+        """Fetch full details (including logs) for a single workflow run."""
+        return self._json(
+            self._request("GET", f"/workflow/{workflow_id}/runs/{run_id}"),
+            f"Fetching workflow {workflow_id} run {run_id}",
+        )
 
     def get_campaign_runs(self, campaign_id: int) -> List[Dict[str, Any]]:
         """All runs (call attempts) of a campaign, across pages."""
@@ -299,24 +311,202 @@ def is_transferred(run: Dict[str, Any]) -> bool:
     return False
 
 
+_ERROR_MSG_KEYS = ("error", "message", "msg", "detail", "details", "reason", "text", "description")
+_LLM_TOKEN_KEYS = frozenset({
+    "llm_tokens", "total_tokens", "prompt_tokens", "completion_tokens",
+    "input_tokens", "output_tokens",
+})
+
+
+def _first_nonempty_str(mapping: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[str]:
+    for key in keys:
+        val = mapping.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = _first_nonempty_str(val, keys)
+            if nested:
+                return nested
+    return None
+
+
+def _extract_event_message(event: Dict[str, Any]) -> str:
+    payload = event.get("payload")
+    data = event.get("data")
+    msg: Optional[str] = None
+    source: Optional[str] = None
+    for container in (payload, data, event):
+        if isinstance(container, str) and container.strip():
+            msg = container.strip()
+            break
+        if isinstance(container, dict):
+            if source is None:
+                for sk in ("service", "component", "source"):
+                    sv = container.get(sk)
+                    if isinstance(sv, str) and sv.strip():
+                        source = sv.strip()
+                        break
+            msg = _first_nonempty_str(container, _ERROR_MSG_KEYS)
+            if msg:
+                break
+    if not msg:
+        raw_obj = payload if payload is not None else (data if data is not None else event)
+        msg = json.dumps(raw_obj, default=str)[:300]
+    if source and source.lower() not in msg.lower():
+        return f"{source}: {msg}"
+    return msg
+
+
+def _extract_pipeline_error_info(run: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    """Return (combined rtf-pipeline-error message, explicit_fatal_flag) from run logs."""
+    logs = run.get("logs")
+    events = logs.get("realtime_feedback_events") if isinstance(logs, dict) else None
+    if events is None:
+        events = run.get("realtime_feedback_events")
+    if not isinstance(events, list):
+        return None, False
+
+    messages: List[str] = []
+    seen: Set[str] = set()
+    explicit_fatal = False
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ev_type = str(
+            ev.get("type") or ev.get("event") or ev.get("name") or ev.get("event_type") or ev.get("kind") or ""
+        ).strip().lower()
+        if ev_type != "rtf-pipeline-error":
+            continue
+        payload = ev.get("payload")
+        data = ev.get("data")
+        if (
+            bool(ev.get("fatal"))
+            or (isinstance(payload, dict) and bool(payload.get("fatal")))
+            or (isinstance(data, dict) and bool(data.get("fatal")))
+        ):
+            explicit_fatal = True
+        msg = _extract_event_message(ev)
+        if msg and msg not in seen:
+            seen.add(msg)
+            messages.append(msg)
+    if not messages:
+        return None, False
+    return "; ".join(messages), explicit_fatal
+
+
+def extract_pipeline_error(run: Dict[str, Any]) -> Optional[str]:
+    """Extract rtf-pipeline-error message(s) from run['logs']['realtime_feedback_events']."""
+    msg, _ = _extract_pipeline_error_info(run)
+    return msg
+
+
+def _llm_usage_tokens(obj: Any) -> int:
+    if isinstance(obj, dict):
+        total = 0
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in _LLM_TOKEN_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
+                total += int(v)
+            elif isinstance(v, (dict, list)):
+                total += _llm_usage_tokens(v)
+        return total
+    if isinstance(obj, list):
+        return sum(_llm_usage_tokens(item) for item in obj)
+    return 0
+
+
+def _is_fatal_pipeline_error(
+    run: Dict[str, Any],
+    pipeline_err: Optional[str],
+    explicit_fatal: bool,
+    duration: Optional[float],
+) -> bool:
+    if not pipeline_err:
+        return False
+    if is_transferred(run):
+        return False
+    disp = (run_disposition(run) or "").strip().lower()
+    if disp in ("user_qualified", "qualified"):
+        return False
+    if explicit_fatal:
+        return True
+
+    g = run.get("gathered_context") if isinstance(run.get("gathered_context"), dict) else {}
+    nodes = g.get("nodes_visited")
+    node_count = len(nodes) if isinstance(nodes, list) else 0
+    usage = run.get("usage_info") if isinstance(run.get("usage_info"), dict) else {}
+    llm_tokens = _llm_usage_tokens(usage)
+
+    err_lower = pipeline_err.lower()
+    tts_or_dead_air = any(
+        marker in err_lower
+        for marker in ("botstartedspeakingframe", "ttsservice", "elevenlabs", "no audio")
+    )
+    if tts_or_dead_air:
+        if node_count <= 1 or llm_tokens == 0 or duration is None or duration < 30.0:
+            return True
+        return False
+
+    if llm_tokens == 0 and node_count <= 1:
+        return True
+    if (not disp or "fail" in disp or "error" in disp) and node_count <= 1:
+        return True
+    return False
+
+
 def outcome_from_run(run: Dict[str, Any], attempts: int = 1) -> CallOutcome:
-    g = run.get("gathered_context") or {}
-    cost = run.get("cost_info") or {}
-    duration = cost.get("call_duration_seconds", cost.get("duration"))
+    g = run.get("gathered_context") if isinstance(run.get("gathered_context"), dict) else {}
+    cost = run.get("cost_info") if isinstance(run.get("cost_info"), dict) else {}
+    usage = run.get("usage_info") if isinstance(run.get("usage_info"), dict) else {}
+
+    raw_duration = cost.get("call_duration_seconds")
+    if raw_duration is None:
+        raw_duration = cost.get("duration")
+    if raw_duration is None:
+        raw_duration = usage.get("call_duration_seconds")
+    if raw_duration is None:
+        raw_duration = usage.get("duration")
     try:
-        duration = float(duration) if duration is not None else None
+        duration = float(raw_duration) if raw_duration is not None else None
     except (TypeError, ValueError):
         duration = None
+
+    disposition = run_disposition(run)
+    disp_lower = (disposition or "").strip().lower()
+    pipeline_err, explicit_fatal = _extract_pipeline_error_info(run)
+
+    status = "called"
+    error: Optional[str] = None
+    if disp_lower in ("failed", "call_failed"):
+        status = "call_failed"
+        if pipeline_err:
+            error = (
+                pipeline_err
+                if pipeline_err.lower().startswith("pipeline error")
+                else f"Pipeline error: {pipeline_err}"
+            )
+        else:
+            reason = g.get("error") or g.get("failure_reason") or g.get("call_error") or run.get("error")
+            error = f"Call failed: {reason}" if reason else f"Call failed (disposition: {disposition})"
+    elif _is_fatal_pipeline_error(run, pipeline_err, explicit_fatal, duration):
+        status = "call_failed"
+        error = (
+            pipeline_err
+            if pipeline_err and pipeline_err.lower().startswith("pipeline error")
+            else f"Pipeline error: {pipeline_err}"
+        )
+
     tags = g.get("call_tags") or []
     return CallOutcome(
-        status="called",
+        status=status,
         run_id=run.get("id"),
-        disposition=run_disposition(run),
+        disposition=disposition,
         duration_seconds=duration,
         tags=tags if isinstance(tags, list) else [tags],
         transcript_url=run.get("transcript_public_url") or run.get("transcript_url"),
         recording_url=run.get("recording_public_url") or run.get("recording_url"),
         attempts=attempts,
+        error=error,
         raw={k: v for k, v in run.items() if k != "logs"},
     )
 

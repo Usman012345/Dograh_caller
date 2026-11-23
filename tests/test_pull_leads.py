@@ -563,7 +563,7 @@ def test_pull_leads_main_fails_before_ping_when_tracker_is_locked(tmp_path, monk
     monkeypatch.setattr(
         pull_leads.Puller,
         "run",
-        lambda self: (_ for _ in ()).throw(AssertionError("Puller.run must not start while tracker is locked")),
+        lambda self, *a, **kw: (_ for _ in ()).throw(AssertionError("Puller.run must not start while tracker is locked")),
     )
 
     held = PipelineTracker(tracker_path)
@@ -574,3 +574,122 @@ def test_pull_leads_main_fails_before_ping_when_tracker_is_locked(tmp_path, monk
         assert "locked" in capsys.readouterr().out.lower()
     finally:
         held.close()
+
+
+def test_pull_leads_main_waits_for_user_before_first_ping_and_quit_pings_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PIPELINE_TRACKER_FILE", tmp_path / "pipeline_tracker.xlsx")
+    monkeypatch.setattr(config, "PULLED_BATCHES_DIR", tmp_path / "pulled")
+    monkeypatch.setattr(config, "LEAD_SOURCE_URL", "http://fake-streamer.invalid")
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", "fake-token")
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(pull_leads, "stop_signals_act_like_ctrl_c", lambda: [])
+
+    ping_calls = []
+    monkeypatch.setattr(pull_leads, "ping", lambda *a, **kw: ping_calls.append(True) or PingResult(EMPTY, "empty"))
+    monkeypatch.setattr(
+        pull_leads,
+        "default_process",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not process leads")),
+    )
+    prompts = []
+    answers = iter(["q"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or next(answers))
+
+    rc = pull_leads.main([])
+    assert rc == 0
+    assert len(prompts) == 1
+    assert "Press Enter to ping" in prompts[0]
+    assert ping_calls == []
+
+
+def test_pull_leads_main_only_pings_after_enter_and_prompts_even_after_leaving_pending(tmp_path, monkeypatch):
+    batches_dir = tmp_path / "pulled"
+    BatchStore(batches_dir).save(PingResult(BATCH, "saved", _leads(2)), "earlier")
+
+    monkeypatch.setattr(config, "PIPELINE_TRACKER_FILE", tmp_path / "pipeline_tracker.xlsx")
+    monkeypatch.setattr(config, "PULLED_BATCHES_DIR", batches_dir)
+    monkeypatch.setattr(config, "LEAD_SOURCE_URL", "http://fake-streamer.invalid")
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", "fake-token")
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(pull_leads, "stop_signals_act_like_ctrl_c", lambda: [])
+
+    events = []
+    answers = iter(["l", "", "q"])
+
+    def fake_input(prompt=""):
+        ans = next(answers)
+        events.append(("ask", ans))
+        return ans
+
+    def fake_ping(url, token, timeout):
+        events.append(("ping",))
+        return PingResult(BATCH, "Received 2", _leads(2))
+
+    def fake_process(leads, threshold, output):
+        events.append(("process", len(leads)))
+        return Counter(received=len(leads))
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(pull_leads, "ping", fake_ping)
+    monkeypatch.setattr(pull_leads, "default_process", fake_process)
+
+    rc = pull_leads.main([])
+    assert rc == 0
+    assert events == [
+        ("ask", "l"),       # leave unfinished batch for later
+        ("ask", ""),        # confirm before first ping
+        ("ping",),
+        ("process", 2),
+        ("ask", "q"),       # quit before second ping
+    ]
+
+
+def test_pull_leads_main_eof_on_stdin_exits_without_ping_or_call(tmp_path, monkeypatch):
+    batches_dir = tmp_path / "pulled"
+    BatchStore(batches_dir).save(PingResult(BATCH, "saved", _leads(1)), "earlier")
+
+    monkeypatch.setattr(config, "PIPELINE_TRACKER_FILE", tmp_path / "pipeline_tracker.xlsx")
+    monkeypatch.setattr(config, "PULLED_BATCHES_DIR", batches_dir)
+    monkeypatch.setattr(config, "LEAD_SOURCE_URL", "http://fake-streamer.invalid")
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", "fake-token")
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(pull_leads, "stop_signals_act_like_ctrl_c", lambda: [])
+    monkeypatch.setattr(
+        pull_leads,
+        "ping",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not ping on EOF")),
+    )
+    monkeypatch.setattr(
+        pull_leads,
+        "default_process",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not process leads on EOF")),
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+
+    assert pull_leads.main([]) == 0
+
+
+def test_pull_leads_main_reprompts_typos_and_quits_on_no_without_ping(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PIPELINE_TRACKER_FILE", tmp_path / "pipeline_tracker.xlsx")
+    monkeypatch.setattr(config, "PULLED_BATCHES_DIR", tmp_path / "pulled")
+    monkeypatch.setattr(config, "LEAD_SOURCE_URL", "http://fake-streamer.invalid")
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", "fake-token")
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(pull_leads, "stop_signals_act_like_ctrl_c", lambda: [])
+    monkeypatch.setattr(
+        pull_leads,
+        "ping",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not ping on typo or 'no'")),
+    )
+    monkeypatch.setattr(
+        pull_leads,
+        "default_process",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not process leads")),
+    )
+
+    prompts = []
+    answers = iter(["maybe", "?", "no"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or next(answers))
+
+    assert pull_leads.main([]) == 0
+    assert len(prompts) == 3

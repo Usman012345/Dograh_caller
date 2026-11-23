@@ -107,6 +107,8 @@ CAMPAIGN_IDLE_TIMEOUT_SECONDS: int = _env_int("CAMPAIGN_IDLE_TIMEOUT_SECONDS", 9
 RESULT_WAIT_SECONDS: int = _env_int("RESULT_WAIT_SECONDS", 20)
 # Extra wait beyond the retry delay for a scheduled retry call to appear.
 RETRY_GRACE_SECONDS: int = _env_int("RETRY_GRACE_SECONDS", 120)
+# Pause a campaign if this many consecutive completed runs fail with the same pipeline error.
+CAMPAIGN_PIPELINE_ERROR_LIMIT: int = _env_int("CAMPAIGN_PIPELINE_ERROR_LIMIT", 3)
 
 # ------------------------------------------------------------------------------
 # Pipeline

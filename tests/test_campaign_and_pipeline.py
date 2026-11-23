@@ -420,3 +420,268 @@ def test_close_drains_pending_results_when_join_interrupted(tmp_path, monkeypatc
         assert any("Drained Co" in map(str, r) for r in rows)
     finally:
         wb.close()
+
+
+def test_monitor_ignores_late_retries_for_already_finished_lead(monkeypatch):
+    monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "RESULT_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(config, "RETRY_GRACE_SECONDS", 0)
+
+    svc = Service(id="svc", name="Svc", agent_id=2, description="d", good_fit="", not_a_fit="")
+    agent = Agent(id=2, name="Agent", version_status="published")
+    lead1 = CampaignLead(ref="L000001", phone="+15125550101", lead={"company": "Fictional One"})
+    lead2 = CampaignLead(ref="L000002", phone="+15125550102", lead={"company": "Fictional Two"})
+    job = CampaignJob(svc, agent, [lead1, lead2])
+    job.campaign_id = 12
+
+    poll = 0
+
+    class LateRetryClient:
+        def get_campaign(self, cid):
+            return {"id": cid, "state": "running", "retry_config": {"enabled": False}}
+
+        def get_campaign_runs(self, cid):
+            nonlocal poll
+            poll += 1
+            runs = [
+                {
+                    "id": 1001,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": "L000001", "phone_number": "+15125550101"},
+                    "gathered_context": {"call_disposition": "no-answer"},
+                }
+            ]
+            if poll >= 2:
+                # Late retry arrives for already-finished L000001, alongside L000002 completing
+                runs.append({
+                    "id": 1002,
+                    "is_completed": False,
+                    "initial_context": {"lead_ref": "L000001", "phone_number": "+15125550101"},
+                })
+                runs.append({
+                    "id": 1003,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": "L000002", "phone_number": "+15125550102"},
+                    "gathered_context": {"call_disposition": "completed"},
+                })
+            return runs
+
+    started = []
+    results = {}
+    asyncio.run(
+        job.monitor(
+            LateRetryClient(),
+            lambda cl, r, att: started.append((cl.ref, r.get("id"), att)),
+            lambda cl, outcome: results.__setitem__(cl.ref, outcome),
+        )
+    )
+    assert ("L000001", 1002, 2) not in started
+    assert results["L000001"].run_id == 1001
+    assert results["L000002"].run_id == 1003
+
+
+def test_monitor_enriches_user_hangup_from_get_workflow_run_and_handles_failures(monkeypatch):
+    monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "RESULT_WAIT_SECONDS", 0.0)
+
+    svc = Service(id="svc", name="Svc", agent_id=2, description="d", good_fit="", not_a_fit="")
+    agent = Agent(id=2, name="Agent", version_status="published")
+    lead1 = CampaignLead(ref="L000001", phone="+15125550101", lead={"company": "Fictional DeadAir"})
+    lead2 = CampaignLead(ref="L000002", phone="+15125550102", lead={"company": "Fictional ErrorDetail"})
+    job = CampaignJob(svc, agent, [lead1, lead2])
+    job.campaign_id = 13
+
+    tts_err = "ElevenLabsTTSService#153 no BotStartedSpeakingFrame within 3.0s"
+    detail_calls = []
+
+    class EnrichClient:
+        def get_campaign(self, cid):
+            return {"id": cid, "state": "running", "workflow_id": 2, "retry_config": {"enabled": False}}
+
+        def get_campaign_runs(self, cid):
+            return [
+                {
+                    "id": 2001,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": "L000001", "phone_number": "+15125550101"},
+                    "gathered_context": {"call_disposition": "user_hangup"},
+                    "usage_info": {"call_duration_seconds": 5},
+                },
+                {
+                    "id": 2002,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": "L000002", "phone_number": "+15125550102"},
+                    "gathered_context": {"call_disposition": "failed"},
+                },
+            ]
+
+        def get_workflow_run(self, workflow_id, run_id):
+            detail_calls.append((workflow_id, run_id))
+            if run_id == 2001:
+                return {
+                    "id": 2001,
+                    "workflow_id": workflow_id,
+                    "logs": {
+                        "realtime_feedback_events": [
+                            {"type": "rtf-pipeline-error", "payload": {"error": tts_err}}
+                        ]
+                    },
+                }
+            raise RuntimeError("transient lookup failure")
+
+    results = {}
+    asyncio.run(
+        job.monitor(
+            EnrichClient(),
+            lambda cl, r, att: None,
+            lambda cl, outcome: results.__setitem__(cl.ref, outcome),
+        )
+    )
+    assert detail_calls == [(2, 2001), (2, 2002)]
+    assert results["L000001"].status == "call_failed"
+    assert results["L000001"].duration_seconds == 5.0
+    assert "ElevenLabsTTSService#153" in (results["L000001"].error or "")
+    # Lookup failure for 2002 falls back cleanly and still classifies disposition="failed" as call_failed
+    assert results["L000002"].status == "call_failed"
+
+
+def test_monitor_circuit_breaker_pauses_campaign_after_consecutive_tts_errors(monkeypatch):
+    monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "RESULT_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(config, "CAMPAIGN_PIPELINE_ERROR_LIMIT", 3)
+
+    svc = Service(id="svc", name="Svc", agent_id=2, description="d", good_fit="", not_a_fit="")
+    agent = Agent(id=2, name="Agent", version_status="published")
+    leads = [
+        CampaignLead(ref=f"L00000{i}", phone=f"+1512555010{i}", lead={"company": f"Fictional {i}"})
+        for i in range(1, 6)
+    ]
+    job = CampaignJob(svc, agent, leads)
+    job.campaign_id = 14
+
+    paused_campaigns = []
+
+    class BrokenTtsClient:
+        def get_campaign(self, cid):
+            return {"id": cid, "state": "running", "workflow_id": 2, "retry_config": {"enabled": False}}
+
+        def get_campaign_runs(self, cid):
+            # Leads 1, 2, 3 complete with the same TTS error (different instance #); leads 4, 5 not started.
+            return [
+                {
+                    "id": 3000 + i,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": f"L00000{i}", "phone_number": f"+1512555010{i}"},
+                    "gathered_context": {"call_disposition": "user_hangup"},
+                    "usage_info": {"call_duration_seconds": 4},
+                }
+                for i in (1, 2, 3)
+            ]
+
+        def get_workflow_run(self, workflow_id, run_id):
+            return {
+                "id": run_id,
+                "workflow_id": workflow_id,
+                "logs": {
+                    "realtime_feedback_events": [
+                        {
+                            "type": "rtf-pipeline-error",
+                            "payload": {
+                                "error": (
+                                    f"ElevenLabsTTSService#{150 + run_id % 10} no BotStartedSpeakingFrame "
+                                    "within 3.0s of pausing frame processing"
+                                )
+                            },
+                        }
+                    ]
+                },
+            }
+
+        def pause_campaign(self, cid):
+            paused_campaigns.append(cid)
+            return "paused"
+
+    results = {}
+    asyncio.run(
+        job.monitor(
+            BrokenTtsClient(),
+            lambda cl, r, att: None,
+            lambda cl, outcome: results.__setitem__(cl.ref, outcome),
+        )
+    )
+    assert paused_campaigns == [14]
+    assert len(results) == 5
+    for i in (1, 2, 3):
+        assert results[f"L00000{i}"].status == "call_failed"
+        assert results[f"L00000{i}"].run_id == 3000 + i
+        assert "no BotStartedSpeakingFrame" in (results[f"L00000{i}"].error or "")
+    for i in (4, 5):
+        assert results[f"L00000{i}"].status == "call_failed"
+        assert results[f"L00000{i}"].run_id is None
+        assert "no BotStartedSpeakingFrame" in (results[f"L00000{i}"].error or "")
+
+
+def test_monitor_circuit_breaker_resets_on_non_pipeline_outcome(monkeypatch):
+    monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "RESULT_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(config, "CAMPAIGN_PIPELINE_ERROR_LIMIT", 3)
+
+    svc = Service(id="svc", name="Svc", agent_id=2, description="d", good_fit="", not_a_fit="")
+    agent = Agent(id=2, name="Agent", version_status="published")
+    leads = [
+        CampaignLead(ref=f"L00000{i}", phone=f"+1512555011{i}", lead={"company": f"Fictional {i}"})
+        for i in range(1, 6)
+    ]
+    job = CampaignJob(svc, agent, leads)
+    job.campaign_id = 15
+    paused = []
+
+    class IntermittentClient:
+        def get_campaign(self, cid):
+            return {"id": cid, "state": "running", "workflow_id": 2, "retry_config": {"enabled": False}}
+
+        def get_campaign_runs(self, cid):
+            # 1 & 2: TTS error, 3: normal called, 4 & 5: TTS error -> never 3 consecutive!
+            disps = {1: "user_hangup", 2: "user_hangup", 3: "completed", 4: "user_hangup", 5: "user_hangup"}
+            return [
+                {
+                    "id": 4000 + i,
+                    "is_completed": True,
+                    "initial_context": {"lead_ref": f"L00000{i}", "phone_number": f"+1512555011{i}"},
+                    "gathered_context": {"call_disposition": disps[i]},
+                    "usage_info": {"call_duration_seconds": 60 if i == 3 else 5},
+                }
+                for i in range(1, 6)
+            ]
+
+        def get_workflow_run(self, workflow_id, run_id):
+            if run_id == 4003:
+                return {"id": run_id, "logs": {"realtime_feedback_events": []}}
+            return {
+                "id": run_id,
+                "logs": {
+                    "realtime_feedback_events": [
+                        {
+                            "type": "rtf-pipeline-error",
+                            "payload": {"error": "ElevenLabsTTSService#153 no BotStartedSpeakingFrame"},
+                        }
+                    ]
+                },
+            }
+
+        def pause_campaign(self, cid):
+            paused.append(cid)
+            return "paused"
+
+    results = {}
+    asyncio.run(
+        job.monitor(
+            IntermittentClient(),
+            lambda cl, r, att: None,
+            lambda cl, outcome: results.__setitem__(cl.ref, outcome),
+        )
+    )
+    assert paused == []
+    assert results["L000003"].status == "called"
+    assert results["L000001"].status == "call_failed"
+    assert results["L000005"].status == "call_failed"

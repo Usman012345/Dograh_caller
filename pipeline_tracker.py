@@ -469,7 +469,7 @@ class PipelineTracker:
                 call_status = str(r.get("call_status") or "").strip()
                 run_id = r.get("dograh_run_id")
                 has_run = run_id is not None and str(run_id).strip() != ""
-                if call_status in ("called", "call_timeout") or has_run:
+                if call_status in ("called", "call_timeout") or (has_run and call_status != "call_failed"):
                     called.add(phone)
             return called
 

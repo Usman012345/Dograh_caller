@@ -75,8 +75,8 @@ Campaigns appear on the Dograh dashboard under **Campaigns**.
 ```
 dograh_caller/
 ├── main.py              Command-line entry point (reads .xlsx / .csv / .json, supports --score-only)
-├── pull_leads.py        Pulls 300-lead batches from the lead streamer (automatic via main.py, or manual)
-├── dashboard_server.py  FastAPI + React dashboard server (monitoring and Start/Stop batch runner)
+├── pull_leads.py        Pulls batches from the lead streamer (waits for Enter before each ping; also used by the dashboard batch runner)
+├── dashboard_server.py  FastAPI + React dashboard server (monitoring and Start/Stop batch runner; idle on startup)
 ├── install.sh           Server setup: .venv, requirements, `pull_leads.py --check`
 ├── GO_LIVE.md           Steps to put https://ai-sdr.grobots.ai live (streamer, nginx, DNS, certbot)
 ├── requirements-dev.txt Test dependencies (pytest, httpx, psycopg for the streamer tests)
@@ -185,11 +185,11 @@ Every run is **live**: leads that pass the threshold are called.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json) called when `python main.py` starts. Relative paths are relative to `dograh_caller/`. `None` = streamer only. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
+| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json) called when `python main.py` starts. Relative paths are relative to `dograh_caller/`. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
 | `INPUT_SHEET` | `None` | Worksheet to read (`None` = first sheet) |
 | `INPUT_LEADS` | `[]` | Lead dicts, e.g. from the scraper. Processed together with the file if both are set. |
 | `LIMIT` | `None` | Process only the first N leads of the file |
-| `USE_STREAMER` | `True` | After the file, keep pulling batches from the lead streamer. `False` = process the file and exit |
+| `USE_STREAMER` | `False` | `False` by default so starting `main.py` never auto-pulls or auto-calls leads from the streamer. Set `True` only if you explicitly want unattended polling after any configured file. |
 | `STREAMER_CHECK_SECONDS` | `60` | Wait between streamer checks while it is not attached or has no new leads |
 
 ### From other code: `run()`
@@ -635,14 +635,12 @@ run_leads_sync(leads, **pipeline_kwargs)    # blocking version for normal script
 
 ### Scraper integration
 
-**Lead streamer (live setup).** `python main.py` first runs `INPUT_FILE_PATH`, then runs
-unattended. It confirms `GET /health` reports the real streamer (no token is sent), pings
-`GET https://ai-sdr.grobots.ai/leads/next` (`Authorization: Bearer <LEAD_SOURCE_TOKEN>`),
-gets one batch of up to 300 leads, saves it to `PULLED_BATCHES_DIR`, runs it through
-`run_leads()` until every call is finished, and takes the next batch. `python pull_leads.py`
-is the manual alternative: it asks a person (Enter = next ping, `q` = quit) instead of continuing.
+**Lead streamer (on-demand setup).** Starting `python dashboard_server.py` or `python pull_leads.py` or `python main.py` never automatically pulls or calls leads on startup:
+- **Dashboard (`python dashboard_server.py`):** starts idle; leads are only pulled and called when you click **Start Batch**, choose batch size (default 300) and number of batches (default 1), and click **Start Run**. It stops automatically when those batches complete.
+- **Manual CLI (`python pull_leads.py`):** runs preflight checks and waits for you to press **Enter** before every ping (including the first one; `q` = quit).
+- **Unattended mode (`USE_STREAMER = True` in `main.py`):** only active if explicitly enabled in code; confirms `GET /health` reports the real streamer (no token is sent), pings `GET https://ai-sdr.grobots.ai/leads/next` (`Authorization: Bearer <LEAD_SOURCE_TOKEN>`), saves batches to `PULLED_BATCHES_DIR`, and processes them continuously.
 
-| Streamer answer | `python main.py` (automatic) | `python pull_leads.py` (manual) |
+| Streamer answer | `Puller.run_auto` (when `USE_STREAMER = True`) | `python pull_leads.py` (manual) |
 |---|---|---|
 | `/health` is not the live streamer | wait, check again | not checked before a ping |
 | `200 "ok"` + leads | save → process fully → next ping | save → process fully → ask |

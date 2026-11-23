@@ -525,3 +525,67 @@ def test_float_string_times_processed_reloaded_cleanly(tmp_path):
         assert t2._by_lead_id[reused]["times_processed"] == 2
     finally:
         t2.close()
+
+
+def test_called_numbers_excludes_call_failed_even_with_dograh_run_id(tmp_path):
+    tracker_path = tmp_path / "tracker.xlsx"
+    verifier = NumberVerifier()
+
+    t1 = PipelineTracker(tracker_path)
+    t1.open()
+    try:
+        failed_id = t1.register({"lead_id": "fail-1", "company": "Fictional Failed", "phone": "(512) 555-0181"}, "python")
+        called_id = t1.register({"lead_id": "ok-1", "company": "Fictional Called", "phone": "(512) 555-0182"}, "python")
+        timeout_id = t1.register({"lead_id": "to-1", "company": "Fictional Timeout", "phone": "(512) 555-0183"}, "python")
+        interrupted_id = t1.register({"lead_id": "int-1", "company": "Fictional Int", "phone": "(512) 555-0184"}, "python")
+
+        for lid, num in (
+            (failed_id, "(512) 555-0181"),
+            (called_id, "(512) 555-0182"),
+            (timeout_id, "(512) 555-0183"),
+            (interrupted_id, "(512) 555-0184"),
+        ):
+            t1.record_verification(lid, verifier.verify({"phone": num}))
+            t1.record_campaign(lid, Agent(2, "Danial", "published"), 10, "Camp")
+
+        t1.record_call_started(failed_id, 701, 1)
+        t1.record_finished(
+            failed_id,
+            "call_failed",
+            "Pipeline error: ElevenLabsTTSService#153",
+            CallOutcome(status="call_failed", run_id=701, error="Pipeline error: ElevenLabsTTSService#153"),
+        )
+
+        t1.record_call_started(called_id, 702, 1)
+        t1.record_finished(called_id, "called", "", CallOutcome(status="called", run_id=702))
+
+        t1.record_call_started(timeout_id, 703, 1)
+        t1.record_finished(timeout_id, "call_timeout", "timed out", CallOutcome(status="call_timeout", run_id=703))
+
+        # Interrupted mid-call with dograh_run_id set and call_status=""
+        t1.record_call_started(interrupted_id, 704, 1)
+
+        called_in_mem = t1.called_numbers()
+        assert "+15125550181" not in called_in_mem
+        assert "+15125550182" in called_in_mem
+        assert "+15125550183" in called_in_mem
+        assert "+15125550184" in called_in_mem
+        assert t1.save() is True
+    finally:
+        t1.close()
+
+    # Reload from disk and verify call_failed remains retryable while others are blocked
+    t2 = PipelineTracker(tracker_path)
+    t2.open()
+    try:
+        called_reloaded = t2.called_numbers()
+        assert "+15125550181" not in called_reloaded
+        assert "+15125550182" in called_reloaded
+        assert "+15125550183" in called_reloaded
+        assert "+15125550184" in called_reloaded
+
+        v2 = NumberVerifier(already_called=called_reloaded)
+        assert v2.verify({"phone": "(512) 555-0181"}).ok is True
+        assert v2.verify({"phone": "(512) 555-0182"}).reason == "dropped_already_called"
+    finally:
+        t2.close()

@@ -4,15 +4,15 @@ Entry point: number verifier -> Gemini decision maker -> Dograh calling agent ->
 
 HOW TO USE
 ==========
-1) Edit the INPUT section below:
+1) Recommended: start the dashboard (`python dashboard_server.py`) and click
+   "Start Batch" when you are ready to pull leads from the streamer and call them.
+   Nothing is pulled or called on startup.
+2) Or edit the INPUT section below for a file / Python list run:
      - INPUT_FILE_PATH : path to your leads spreadsheet (.xlsx / .csv / .json), or None
      - INPUT_LEADS     : lead dicts (e.g. from the scraper), or an empty list
-     - USE_STREAMER    : True = after the file, keep pulling leads from the streamer
-2) Run:   python main.py      (always LIVE: qualified leads are called)
-
-It calls the file's leads, then waits for the lead streamer. Once the reverse
-proxy is attached and the streamer answers, batches are processed automatically.
-Press Ctrl+C to stop.
+     - USE_STREAMER    : False by default (never auto-pulls on startup); set True
+                         only if you explicitly want unattended streamer polling
+   Then run:   python main.py      (always LIVE: qualified leads are called)
 
 From other code (e.g. the AI-powered scraper), call run() with a file path,
 one dict, or a list of dicts:
@@ -45,7 +45,7 @@ from pipeline import run_leads_sync
 # ==============================================================================
 
 # Path to a leads file: .xlsx (first row = column names), .csv or .json.
-# Relative paths are relative to this folder. None = no file (streamer only).
+# Relative paths are relative to this folder. None = no file.
 # Every run is LIVE: qualified leads in this file are called when you run main.py.
 # Don't use examples/sample_leads.xlsx here - its numbers are fictional.
 INPUT_FILE_PATH: Optional[str] = None
@@ -70,10 +70,11 @@ INPUT_LEADS: List[Dict[str, Any]] = [
 # Only process the first N leads of the file (None = all). Handy for a first real test.
 LIMIT: Optional[int] = None
 
-# True: after the file, keep checking the lead streamer (LEAD_SOURCE_URL in .env).
-# Until the reverse proxy is attached it just waits; then it takes and calls each batch.
-# False: process the file and exit.
-USE_STREAMER: bool = True
+# False (default): never auto-pull or auto-call from the lead streamer on startup.
+# Start the dashboard (`python dashboard_server.py`) and click "Start Batch" to
+# pull and call leads on demand, or set USE_STREAMER = True only if you explicitly
+# want unattended polling after any configured file.
+USE_STREAMER: bool = False
 
 # Seconds between streamer checks while it is not attached or has no new leads.
 STREAMER_CHECK_SECONDS: int = 60
@@ -233,7 +234,7 @@ def run_configured(
     threshold: Optional[float] = None,
     output: Optional[str] = None,
 ) -> int:
-    """`python main.py`: call the configured file, then keep serving the lead streamer."""
+    """`python main.py`: run INPUT_FILE_PATH / INPUT_LEADS configured in main.py (polls streamer only if USE_STREAMER = True)."""
     active_threshold = config.INTEREST_THRESHOLD if threshold is None else threshold
     if not 0 < active_threshold <= 1:
         print(f"The threshold must be above 0 and at most 1 (0.80 = 80%), got {active_threshold}.")
@@ -242,11 +243,12 @@ def run_configured(
         leads = collect_leads(INPUT_FILE_PATH, sheet) + collect_leads(INPUT_LEADS)
     except Exception as e:
         print(f"Could not load leads: {e}")
-        print("Fix INPUT_FILE_PATH at the top of main.py (None = no file, streamer only).")
+        print("Fix INPUT_FILE_PATH at the top of main.py (or set it to None).")
         return 1
     if not leads and not USE_STREAMER:
         if INPUT_FILE_PATH is None:
-            print("No input set. Set INPUT_FILE_PATH (or INPUT_LEADS) at the top of main.py,\n"
+            print("No input set. Start the dashboard with `python dashboard_server.py` to pull and call leads on demand,\n"
+                  "or set INPUT_FILE_PATH (or INPUT_LEADS) at the top of main.py,\n"
                   "or run: python main.py path\\to\\leads.xlsx")
         else:
             print("No leads found in the input.")

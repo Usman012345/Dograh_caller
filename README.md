@@ -63,18 +63,19 @@ streamer answers at `LEAD_SOURCE_URL`, and that it accepts the token.
 Copy this folder to the server **with its `.env`**, then:
 
 ```bash
-bash install.sh               # .venv + requirements + the --check above; no root needed
-tmux new -s caller            # keeps it running if your SSH connection drops
-.venv/bin/python main.py      # runs INPUT_FILE_PATH, then pulls from the streamer automatically
+bash install.sh                      # .venv + requirements + the --check above; no root needed
+tmux new -s caller                   # keeps it running if your SSH connection drops
+.venv/bin/python dashboard_server.py # starts idle; click Start Batch in the UI to pull/call leads
 ```
 
-Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. If the
-process is killed or the SSH session ends anyway, it stops the same way as
-Ctrl+C: this run's Dograh campaigns are paused and the unfinished batch is
-kept and continues on the next start.
+Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. Nothing is
+pulled or called on startup — leads are only pulled and called when you start a
+batch run in the dashboard (or press Enter in `pull_leads.py`). If a running batch
+is stopped or interrupted, this run's Dograh campaigns are paused and the
+unfinished batch is kept and continues on the next start.
 
 On Windows: `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`,
-then `.venv\Scripts\python main.py`. (`bash install.sh` also works in Git Bash.)
+then `.venv\Scripts\python dashboard_server.py`. (`bash install.sh` also works in Git Bash.)
 
 Tests: `pip install -r requirements-dev.txt`, then `python -m pytest`.
 
@@ -100,23 +101,23 @@ fields that describe the business. Details: [DOCUMENTATION.md](DOCUMENTATION.md)
 **Step 2 — Point the program at your file.** Open [main.py](main.py) and edit the top:
 
 ```python
-INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"   # None = no file, streamer only
+INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"   # None = no file
 LIMIT = None                                     # or 5 for only the first 5 businesses
-USE_STREAMER = True                              # keep pulling from the streamer after the file
+USE_STREAMER = False                             # False by default (never auto-pulls on startup)
 STREAMER_CHECK_SECONDS = 60
 ```
 
 **Step 3 — Run it:**
 
 ```bash
-python main.py                  # live: calls the file's qualified leads, then serves the streamer
+python main.py                           # live: calls the file's qualified leads and exits
 python main.py leads.xlsx --score-only   # test scoring only; never calls Dograh
 ```
 
-After the file finishes, the program keeps running and checks the streamer every
-60 seconds. While the reverse proxy is not attached it only waits. Once the real
-streamer answers, it takes a batch, calls it completely, and takes the next one.
-Press **Ctrl+C** to stop.
+With `USE_STREAMER = False` (the default), `python main.py` never pulls or calls
+leads from the streamer automatically on startup. To pull and call streamer
+batches on demand, start `python dashboard_server.py` and click **Start Batch**
+(or run `python pull_leads.py` in the terminal).
 
 > ⚠️ **Normal runs are live.** Businesses that pass the 80% threshold really get called.
 > Pass `--score-only` to test verification and Gemini scoring safely without contacting Dograh or touching `output/call_results.xlsx`.
@@ -217,26 +218,24 @@ LEAD_SOURCE_TOKEN=the-streamer's-STREAM_TOKEN
 # LEAD_SOURCE_URL=https://ai-sdr.grobots.ai   (default)
 ```
 
-Then run:
+Then start the dashboard (nothing is pulled or called on startup):
 
 ```bash
-python main.py
+python dashboard_server.py
 ```
 
-1. It confirms the real streamer answers `/health`. Until then it just waits.
-2. It pings the streamer and receives one batch of up to **300** leads.
-3. It saves the batch to `output/pulled_batches/`, then processes **all** of it
-   (check numbers → Gemini → campaigns → every call finished → results sheet).
-4. It immediately asks for the next batch. With no new leads, it checks again
-   every `STREAMER_CHECK_SECONDS`.
+1. Open <http://127.0.0.1:8090> and click **Start Batch** when you are ready to run a job.
+2. Choose the batch size (default **300**, 1–1,000) and number of batches (default **1**, 1–100), then click **Start Run**.
+3. The runner verifies keys/agents, pings the streamer for a batch, saves it to `output/pulled_batches/`, and processes all of it (check numbers → Gemini → campaigns → every call finished → results & tracker).
+4. Once the requested batches finish, it stops automatically and waits idle until you click **Start Batch** again.
 
-If it is stopped mid-batch (Ctrl+C, crash, error), the batch stays in
-`output/pulled_batches/*.pending.json` and is finished first on the next start,
-before any new leads are taken. That matters because the streamer marks leads as
+If a batch is stopped mid-run (**Stop** button, Ctrl+C, crash, error), it stays in
+`output/pulled_batches/*.pending.json` and is finished first on the next **Start Batch**
+run, before any new leads are taken. That matters because the streamer marks leads as
 sent the moment it hands them out. Numbers that were already called are skipped.
 
-To approve every batch by hand instead, run `python pull_leads.py`: it waits for
-**Enter** before each ping.
+To pull batches from the terminal instead, run `python pull_leads.py`: it stays idle
+until you press **Enter** before every ping (including the first one).
 
 ## 7. Sending leads from other code
 
