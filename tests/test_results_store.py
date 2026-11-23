@@ -173,3 +173,99 @@ def test_atomic_save_cleans_temp_file_on_success_and_permission_error(tmp_path, 
     assert store.save() is False
     assert list(tmp_path.glob("*.tmp*")) == []
     assert path.read_bytes() == original_bytes
+
+
+def test_illegal_control_chars_cleaned_and_later_rows_save(tmp_path):
+    path = tmp_path / "call_results.xlsx"
+    store = ResultsStore(path)
+    store.append(
+        {"processed_at": "2026-11-23 10:00:00", "status": "called", "phone_e164": "+15125550101"},
+        lead={"company\x0bname": "Fictional\x0bConcrete Co"},
+    )
+    assert store.save() is True
+
+    store.append(
+        {"processed_at": "2026-11-23 10:05:00", "status": "called", "phone_e164": "+15125550102"},
+        lead={"company name": "Fictional Second Co"},
+    )
+    assert store.save() is True
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = list(wb[SHEET_NAME].iter_rows(values_only=True))
+        header = rows[0]
+        assert "company name" in header
+        idx = header.index("company name")
+        assert rows[2][idx] == "Fictional Concrete Co"
+        assert rows[3][idx] == "Fictional Second Co"
+    finally:
+        wb.close()
+
+
+def test_formula_like_strings_saved_as_plain_text(tmp_path):
+    path = tmp_path / "call_results.xlsx"
+    store = ResultsStore(path)
+    store.append(
+        {"processed_at": "2026-11-23 10:00:00", "status": "called", "phone_e164": "+15125550101"},
+        lead={"company": "=SUM(1,2)", "notes": "=HYPERLINK(\"http://example.com\",\"click\")"},
+    )
+    assert store.save() is True
+
+    wb = load_workbook(path)
+    try:
+        ws = wb[SHEET_NAME]
+        header = [c.value for c in ws[1]]
+        comp_cell = ws.cell(row=3, column=header.index("company") + 1)
+        notes_cell = ws.cell(row=3, column=header.index("notes") + 1)
+        assert comp_cell.data_type == "s"
+        assert comp_cell.value == "=SUM(1,2)"
+        assert notes_cell.data_type == "s"
+        assert notes_cell.value == '=HYPERLINK("http://example.com","click")'
+    finally:
+        wb.close()
+
+
+def test_default_interest_threshold_is_0_80():
+    assert config.INTEREST_THRESHOLD == 0.80
+
+
+def test_malformed_timestamp_under_date_banner_stays_under_banner_on_reload(tmp_path):
+    path = tmp_path / "call_results.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = SHEET_NAME
+    ws.append(FIXED_COLUMNS + ["company"])
+    ws.append(["2026-11-22"])
+    ws.append(["not-a-timestamp", "called", None, None, "+15125550155", None, None, None, None, None, None, None, "Banner Co"])
+    wb.save(path)
+
+    for _ in range(2):
+        store = ResultsStore(path)
+        assert store.save() is True
+
+    reloaded = load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = list(reloaded[SHEET_NAME].iter_rows(values_only=True))
+        col0 = [r[0] for r in rows[1:]]
+        assert "unknown date" not in col0
+        assert col0 == ["2026-11-22", "not-a-timestamp"]
+    finally:
+        reloaded.close()
+
+
+def test_two_distinct_keys_cleaning_to_same_name_do_not_get_lead_prefix(tmp_path):
+    path = tmp_path / "call_results.xlsx"
+    store = ResultsStore(path)
+    store.append(
+        {"processed_at": "2026-11-23 10:00:00", "status": "called", "phone_e164": "+15125550166"},
+        lead={"company\x0bname": "Clean One", "company name": "Clean Two"},
+    )
+    assert store.save() is True
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        header = list(next(wb[SHEET_NAME].iter_rows(values_only=True)))
+        assert "lead.company name" not in header
+        assert "company name" in header
+        assert "company name_2" in header
+    finally:
+        wb.close()

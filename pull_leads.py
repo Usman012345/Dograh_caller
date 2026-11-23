@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Pull leads from the lead streamer one batch at a time, with a person in control.
+Pull leads from the lead streamer one batch at a time.
 
-    python pull_leads.py
+    python main.py        automatic: runs the configured file, then keeps pulling batches
+    python pull_leads.py  manual: a person presses Enter before every next ping
 
     1. ping   GET https://ai-sdr.grobots.ai/leads/next   (Authorization: Bearer <token>)
     2. get    one batch of up to 300 lead dicts
     3. save   the batch to output/pulled_batches/ (the streamer has already marked
               these leads as sent, so this copy is the only one)
-    4. run    the whole batch through the pipeline: number check -> Jev -> Dograh
+    4. run    the whole batch through the pipeline: number check -> Gemini -> Dograh
               campaigns -> every call finished -> output/call_results.xlsx
     5. wait   for a person: Enter = ping for the next batch, q = quit
 
-It never pings by itself after a batch: every next ping needs a human to press
-Enter. That includes "no new leads" and error answers.
+In manual mode every next ping needs a human to press Enter. In automatic mode
+(Puller.run_auto) it first confirms the real streamer answers /health, then
+pings, finishes each batch completely, and checks again on a timer.
 
 Settings (.env): LEAD_SOURCE_URL (default https://ai-sdr.grobots.ai),
 LEAD_SOURCE_TOKEN (= the streamer's STREAM_TOKEN), LEAD_BATCH_SIZE (300).
@@ -27,6 +29,7 @@ import json
 import os
 import signal
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -45,6 +48,9 @@ BATCH = "batch"     # leads received
 EMPTY = "empty"     # streamer has nothing new right now
 RETRY = "retry"     # no leads this time (network, 404, 503, bad answer); a person may try again
 FATAL = "fatal"     # configuration problem (401 token, 421 host); trying again won't help
+
+MIN_AUTO_CHECK_SECONDS = 5
+MAX_AUTO_BACKOFF_SECONDS = 3600
 
 
 @dataclass
@@ -66,9 +72,12 @@ def _error_detail(resp: requests.Response) -> str:
 
 
 def ping(base_url: str, token: str, timeout: float,
-         session: Optional[requests.Session] = None) -> PingResult:
+         session: Optional[requests.Session] = None,
+         limit: Optional[int] = None) -> PingResult:
     """One GET <base_url>/leads/next. Never raises for HTTP or network problems."""
     url = f"{base_url.rstrip('/')}/leads/next"
+    if limit is not None:
+        url = f"{url}?limit={int(limit)}"
     http = session or requests
     try:
         resp = http.get(
@@ -76,6 +85,7 @@ def ping(base_url: str, token: str, timeout: float,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
                      "Accept-Encoding": "gzip"},
             timeout=(15, timeout),
+            allow_redirects=False,
         )
     except requests.exceptions.Timeout:
         return PingResult(RETRY, f"No answer from {url} within {timeout:.0f}s. If the streamer did "
@@ -109,7 +119,8 @@ def ping(base_url: str, token: str, timeout: float,
             pass
         wait = wait or resp.headers.get("Retry-After") or "a few"
         return PingResult(RETRY, f"Streamer is busy or its database is unavailable (HTTP 503: "
-                                 f"{_error_detail(resp)}). Wait {wait} seconds, then try again.")
+                                 f"{_error_detail(resp)}). Wait {wait} seconds, then try again.",
+                          meta={"retry_after": wait})
     if code != 200:
         return PingResult(RETRY, f"Unexpected answer HTTP {code} from {url}: {_error_detail(resp)}")
 
@@ -156,7 +167,12 @@ class BatchStore:
     def save(self, result: PingResult, source: str) -> Path:
         self.folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        path = self.folder / f"batch_{stamp}_{len(result.leads)}.pending.json"
+        n_leads = len(result.leads)
+        path = self.folder / f"batch_{stamp}_{n_leads}.pending.json"
+        seq = 1
+        while path.exists() or path.with_name(path.name.replace(".pending.json", ".done.json")).exists():
+            path = self.folder / f"batch_{stamp}_{seq}_{n_leads}.pending.json"
+            seq += 1
         tmp = path.with_name(path.name + ".tmp")
         doc = {"received_at": datetime.now().isoformat(timespec="seconds"), "source": source,
                **result.meta, "leads": result.leads}
@@ -202,21 +218,79 @@ def say(message: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {'source':<8} {message}", flush=True)
 
 
-def default_process(leads: List[Dict[str, Any]], threshold: Optional[float],
-                    output: Optional[str]) -> Counter:
+def save_failed_for_retry(failed: List[Dict[str, Any]], batches_dir: Optional[Path] = None) -> Path:
+    """Keep leads Gemini could not score as a pending batch, so they are processed again."""
+    folder = Path(batches_dir) if batches_dir is not None else config.PULLED_BATCHES_DIR
+    retry_path = BatchStore(folder).save(PingResult(BATCH, leads=failed), "decision_retry")
+    say(f"Saved {len(failed)} failed-decision lead(s) for retry -> {retry_path.name}")
+    return retry_path
+
+
+def default_process(
+    leads: List[Dict[str, Any]],
+    threshold: Optional[float],
+    output: Optional[str],
+    *,
+    batch_size: Optional[int] = None,
+    stop_event: Optional[Any] = None,
+    batches_dir: Optional[Path] = None,
+    tracker_file: Optional[Path] = None,
+) -> Counter:
     from pipeline import run_leads_sync
-    return run_leads_sync(leads, threshold=threshold, results_file=output)
+    failed: List[Dict[str, Any]] = []
+    extra_kwargs: Dict[str, Any] = {}
+    if tracker_file is not None:
+        extra_kwargs["tracker_file"] = tracker_file
+    stats = run_leads_sync(
+        leads,
+        batch_size=batch_size or config.LEAD_BATCH_SIZE,
+        stop_event=stop_event,
+        threshold=threshold,
+        results_file=output,
+        failed_leads=failed,
+        source_label="streamer",
+        **extra_kwargs,
+    )
+    if failed and not (stop_event is not None and stop_event.is_set()):
+        save_failed_for_retry(failed, batches_dir=batches_dir)
+    return stats
 
 
-def preflight() -> Optional[str]:
-    """Check the keys before taking leads from the streamer. Returns a problem, or None."""
-    if not config.LEAD_SOURCE_TOKEN:
-        return "LEAD_SOURCE_TOKEN is missing in .env (the streamer's STREAM_TOKEN)."
-    if not config.JEV_API_KEY:
-        return "Jev API key not found. Put it in .env as Jev_Key=..."
+def streamer_is_ready(base_url: str, timeout: float = 20) -> bool:
+    """
+    True only when the real lead streamer answers /health with a working database.
+    No token is sent, so nothing reaches another site while the proxy is not attached.
+    """
     try:
-        from decision_maker import load_services
+        resp = requests.get(f"{base_url.rstrip('/')}/health", timeout=timeout, allow_redirects=False)
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return False
+    return (resp.status_code == 200 and isinstance(data, dict)
+            and data.get("status") == "alive" and data.get("database") == "ok")
+
+
+def preflight(need_streamer: bool = True) -> Optional[str]:
+    """Check the keys before taking leads from the streamer. Returns a problem, or None."""
+    if need_streamer and not config.LEAD_SOURCE_TOKEN:
+        return "LEAD_SOURCE_TOKEN is missing in .env (the streamer's STREAM_TOKEN)."
+    if not config.GEMINI_API_KEY:
+        return "Gemini API key not found. Put it in .env as GEMINI_API_KEY=... (or GEMINI_API=...)."
+    if not 0 < config.INTEREST_THRESHOLD <= 1:
+        return (
+            f"INTEREST_THRESHOLD must be above 0 and at most 1 (0.80 = 80%), "
+            f"got {config.INTEREST_THRESHOLD!r}."
+        )
+    try:
+        from decision_maker import VALID_THINKING_LEVELS, check_gemini_access, load_services
         from dograh_client import DograhClient
+        thinking_level = config.GEMINI_THINKING_LEVEL.upper()
+        if thinking_level not in VALID_THINKING_LEVELS:
+            return (
+                f"GEMINI_THINKING_LEVEL must be one of {', '.join(VALID_THINKING_LEVELS)}, "
+                f"got {thinking_level!r}."
+            )
+        check_gemini_access(config.GEMINI_API_KEY, config.GEMINI_MODEL)
         services = load_services(config.SERVICES_FILE)
         if not services:
             return f"No enabled services in {config.SERVICES_FILE.name}."
@@ -252,9 +326,10 @@ class Puller:
         self.ping = ping_fn
         self.batches_done = 0
         self.leads_done = 0
+        self.last_stats: Any = {}
 
-    def _run_batch(self, path: Path) -> str:
-        """Process one saved batch completely. Returns 'done', 'later' or 'quit'."""
+    def _run_batch(self, path: Path, auto: bool = False) -> str:
+        """Process one saved batch completely. Returns 'done', 'later', 'failed' (auto) or 'quit'."""
         while True:
             doc = self.store.load(path)
             leads = doc["leads"]
@@ -265,7 +340,7 @@ class Puller:
                     "the streamer has already marked them as sent.")
             say(f"Processing {len(leads)} lead(s) from {path.name} - LIVE: qualified leads will be called")
             try:
-                self.process(leads)
+                self.last_stats = self.process(leads) or {}
             except KeyboardInterrupt:
                 print()
                 say(f"Stopped by user. This run's campaigns were paused. The batch is kept in {path} "
@@ -274,6 +349,8 @@ class Puller:
             except Exception as e:
                 say(f"ERROR while processing the batch: {e}")
                 say(f"The batch is kept in {path}.")
+                if auto:
+                    return "failed"
                 answer = self.ask("Enter = try this batch again, l = leave it for later, q = quit: ")
                 if answer == "q":
                     return "quit"
@@ -341,6 +418,94 @@ class Puller:
             if self._run_batch(path) == "quit":
                 return self._bye(130)
 
+    def run_auto(
+        self,
+        check_seconds: float,
+        *,
+        ready_fn: Callable[[str], bool] = streamer_is_ready,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> int:
+        """
+        Run unattended until stopped: finish saved batches, wait for the real streamer,
+        take one batch, call it completely, repeat. New leads are never taken while a
+        saved batch is unfinished, because the streamer marks leads as sent on hand-out.
+        """
+        check_seconds = max(MIN_AUTO_CHECK_SECONDS, check_seconds)
+        last_note = ""
+        connected = False
+        failures = 0
+        unreadable = set()
+
+        def note(message: str) -> None:
+            nonlocal last_note
+            if message != last_note:
+                say(message)
+                last_note = message
+
+        say(f"Automatic mode: checking {self.source_url} every {check_seconds:.0f}s. Press Ctrl+C to stop.")
+        try:
+            while True:
+                pending = [p for p in self.store.unfinished() if p not in unreadable]
+                if pending:
+                    path = pending[0]
+                    try:
+                        self.store.load(path)
+                    except (OSError, ValueError) as e:
+                        say(f"WARNING: cannot read {path.name} ({e}); leaving it alone")
+                        unreadable.add(path)
+                        continue
+                    last_note = ""
+                    self.last_stats = {}
+                    outcome = self._run_batch(path, auto=True)
+                    if outcome == "quit":
+                        return self._bye(130)
+                    if outcome == "failed" or self.last_stats.get("decision_error"):
+                        failures += 1
+                        wait = min(check_seconds * 2 ** (failures - 1), MAX_AUTO_BACKOFF_SECONDS)
+                        say(f"Retrying unfinished leads in {wait:.0f}s. No new leads are taken until then.")
+                        sleep_fn(wait)
+                    else:
+                        failures = 0
+                    continue
+
+                if not ready_fn(self.source_url):
+                    connected = False
+                    note("Waiting for the lead streamer. Processing starts as soon as it is connected.")
+                    sleep_fn(check_seconds)
+                    continue
+                if not connected:
+                    connected = True
+                    last_note = ""
+                    say("Lead streamer connected.")
+
+                result = self.ping(self.source_url, self.token, self.timeout)
+                if result.kind == FATAL:
+                    say(f"STOP: {result.message}")
+                    return self._bye(2)
+                if result.kind == EMPTY:
+                    note(f"{result.message}. Checking again every {check_seconds:.0f}s.")
+                    sleep_fn(check_seconds)
+                    continue
+                if result.kind == RETRY:
+                    note(f"No batch: {result.message}")
+                    try:
+                        retry_after = float(result.meta.get("retry_after"))
+                    except (TypeError, ValueError):
+                        retry_after = 0
+                    sleep_fn(max(check_seconds, retry_after))
+                    continue
+
+                meta = result.meta
+                mix = ""
+                if meta.get("new") is not None or meta.get("updated") is not None:
+                    mix = f" (new {meta.get('new') or 0}, updated {meta.get('updated') or 0})"
+                say(f"{result.message}{mix}")
+                self.store.save(result, self.source_url)
+        except KeyboardInterrupt:
+            print()
+            say("Stopped by user. Any unfinished batch is kept and continues on the next start.")
+            return self._bye(130)
+
     def _bye(self, code: int) -> int:
         say(f"Finished: {self.batches_done} batch(es), {self.leads_done} lead(s) processed this session.")
         return code
@@ -388,12 +553,16 @@ def check_setup(source_url: str) -> int:
         print(f"FAIL caller setup: {problem}")
         ok = False
     else:
-        print(f"OK   caller setup: Jev key, {config.SERVICES_FILE.name} and Dograh agents at {config.DOGRAH_BASE_URL}")
+        print(
+            f"OK   caller setup: Gemini ({config.GEMINI_MODEL}, threshold {config.INTEREST_THRESHOLD:.0%}), "
+            f"{config.SERVICES_FILE.name} and Dograh agents at {config.DOGRAH_BASE_URL}"
+        )
 
     base = source_url.rstrip("/")
     try:
-        r = requests.get(f"{base}/health", timeout=20)
-        data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else None
+        r = requests.get(f"{base}/health", timeout=20, allow_redirects=False)
+        ctype = r.headers.get("Content-Type", "").lower()
+        data = r.json() if ctype.startswith("application/json") else None
     except (requests.RequestException, ValueError) as e:
         print(f"FAIL streamer: cannot reach {base}/health: {e}")
         return 1
@@ -410,14 +579,21 @@ def check_setup(source_url: str) -> int:
     if config.LEAD_SOURCE_TOKEN:
         try:
             r = requests.get(f"{base}/stats", headers={"Authorization": f"Bearer {config.LEAD_SOURCE_TOKEN}"},
-                             timeout=60)
+                             timeout=60, allow_redirects=False)
         except requests.RequestException as e:
             print(f"FAIL streamer token: {e}")
             return 1
         if r.status_code == 200:
-            s = r.json()
-            print(f"OK   streamer token accepted: {s.get('never_sent', '?')} lead(s) never sent, "
-                  f"{s.get('updated_since_sent', '?')} updated, {s.get('eligible', '?')} with a phone in total")
+            try:
+                s = r.json()
+            except ValueError:
+                s = None
+            if not isinstance(s, dict):
+                print(f"FAIL streamer /stats: HTTP 200 returned non-JSON or unexpected body ({r.headers.get('Content-Type', '?')})")
+                ok = False
+            else:
+                print(f"OK   streamer token accepted: {s.get('never_sent', '?')} lead(s) never sent, "
+                      f"{s.get('updated_since_sent', '?')} updated, {s.get('eligible', '?')} with a phone in total")
         elif r.status_code == 401:
             print("FAIL streamer token: rejected (HTTP 401) - LEAD_SOURCE_TOKEN must equal the streamer's STREAM_TOKEN")
             ok = False
@@ -442,12 +618,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Only test keys, Dograh agents and the streamer (token included); take no leads")
     args = parser.parse_args(argv)
 
+    active_threshold = config.INTEREST_THRESHOLD if args.threshold is None else args.threshold
+    if not 0 < active_threshold <= 1:
+        print(f"The threshold must be above 0 and at most 1 (0.80 = 80%), got {active_threshold}.")
+        return 1
+
     if args.check:
         return check_setup(args.url or config.LEAD_SOURCE_URL)
 
     problem = preflight()
     if problem:
         print(problem)
+        return 1
+
+    from pipeline_tracker import PipelineTracker, TrackerLockedError
+    try:
+        PipelineTracker(config.PIPELINE_TRACKER_FILE).assert_unlocked()
+    except TrackerLockedError as e:
+        print(e)
         return 1
 
     stop_signals_act_like_ctrl_c()

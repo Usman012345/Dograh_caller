@@ -86,7 +86,7 @@ class CampaignJob:
             included.append(cl)
         self.leads = included
         if not rows:
-            raise DograhError(f"No lead has the values agent '{self.agent.name}' needs: {', '.join(sorted(required))}")
+            return
         file_key = client.upload_csv(rows, f"{self.name}.csv")
         campaign = client.create_campaign(self.name, self.agent.id, file_key)
         self.campaign_id = int(campaign["id"])
@@ -100,6 +100,7 @@ class CampaignJob:
         on_call_started: Callable[[CampaignLead, Dict[str, Any], int], None],
         on_result: Callable[[CampaignLead, CallOutcome], None],
         progress_clock: Optional[List[float]] = None,
+        stop_event: Optional[Any] = None,
     ) -> None:
         """Follow the campaign until every lead has a final outcome."""
         assert self.campaign_id is not None
@@ -126,7 +127,21 @@ class CampaignJob:
             on_result(cl, outcome)
 
         while True:
-            await asyncio.sleep(config.CAMPAIGN_POLL_SECONDS)
+            if stop_event is not None and stop_event.is_set():
+                return
+            if stop_event is None:
+                await asyncio.sleep(config.CAMPAIGN_POLL_SECONDS)
+            else:
+                deadline = time.monotonic() + float(config.CAMPAIGN_POLL_SECONDS)
+                while True:
+                    if stop_event.is_set():
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.2, remaining))
+                if stop_event.is_set():
+                    return
             try:
                 details = await asyncio.to_thread(client.get_campaign, self.campaign_id)
                 runs = await asyncio.to_thread(client.get_campaign_runs, self.campaign_id)
@@ -139,6 +154,8 @@ class CampaignJob:
                             finish(cl, CallOutcome(status="call_failed", error=f"Lost contact with Dograh: {e}"))
                     return
                 continue
+            if stop_event is not None and stop_event.is_set():
+                return
 
             # Group call attempts by lead
             attempts: Dict[str, List[Dict[str, Any]]] = {}

@@ -192,7 +192,11 @@ def test_pipeline_abort_drains_queued_results_and_stops_campaigns(tmp_path, monk
     monkeypatch.setattr("pipeline.DecisionMaker", FakeDecider)
 
     async def run():
-        pipeline = LeadPipeline(results_file=results_xlsx, services_file=services_yaml)
+        pipeline = LeadPipeline(
+            results_file=results_xlsx,
+            services_file=services_yaml,
+            tracker_file=tmp_path / "tracker.xlsx",
+        )
         await pipeline.start()
         pipeline._live_campaigns[42] = "Draftliner_2026-11-19"
         await pipeline.submit({"company": "Test Bistro", "category": "Restaurant", "phone": "(512) 555-0101"})
@@ -205,3 +209,214 @@ def test_pipeline_abort_drains_queued_results_and_stops_campaigns(tmp_path, monk
     asyncio.run(run())
     assert stopped_campaigns == [42]
     assert results_xlsx.exists()
+
+
+def test_all_skipped_campaign_does_not_log_or_raise_failed_start(tmp_path, monkeypatch, capsys):
+    services_yaml = tmp_path / "services.yaml"
+    services_yaml.write_text(
+        "services:\n"
+        "  - id: draftliner\n"
+        "    name: Draftliner\n"
+        "    agent_id: 2\n"
+        "    description: AEC staffing\n",
+        encoding="utf-8",
+    )
+    results_xlsx = tmp_path / "results.xlsx"
+    tracker_xlsx = tmp_path / "tracker.xlsx"
+    monkeypatch.setattr(config, "TRANSFERS_FILE", tmp_path / "transfers.xlsx")
+
+    class FakeDograh:
+        def get_agent(self, agent_id):
+            return Agent(id=agent_id, name="Danial", version_status="published")
+
+        def get_required_variables(self, agent_id):
+            return {"city"}  # lead lacks city -> every lead skipped
+
+        def upload_csv(self, *args, **kwargs):
+            raise AssertionError("upload_csv must not be called when all leads are skipped")
+
+        def create_campaign(self, *args, **kwargs):
+            raise AssertionError("create_campaign must not be called when all leads are skipped")
+
+        def close(self):
+            pass
+
+    class FakeDecider:
+        def __init__(self, services, threshold, api_key, model):
+            self.services = services
+
+        async def decide(self, lead):
+            return Decision(
+                probabilities={"draftliner": 0.95},
+                service=self.services[0],
+                probability=0.95,
+                threshold=0.80,
+                model="gemini-3.8-flash",
+            )
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("pipeline.DograhClient", FakeDograh)
+    monkeypatch.setattr("pipeline.DecisionMaker", FakeDecider)
+
+    async def run():
+        async with LeadPipeline(
+            results_file=results_xlsx,
+            services_file=services_yaml,
+            tracker_file=tracker_xlsx,
+        ) as p:
+            await p.submit({"company": "No City Co", "phone": "(512) 555-0101"})
+            return p.stats
+
+    stats = asyncio.run(run())
+    out = capsys.readouterr().out
+    assert "FAILED to start" not in out
+    assert stats["skipped_missing_data"] == 1
+    assert stats["call_failed"] == 0
+
+
+def test_stop_event_interrupts_pipeline_and_pauses_campaign(tmp_path, monkeypatch):
+    services_yaml = tmp_path / "services.yaml"
+    services_yaml.write_text(
+        "services:\n"
+        "  - id: draftliner\n"
+        "    name: Draftliner\n"
+        "    agent_id: 2\n"
+        "    description: AEC staffing\n",
+        encoding="utf-8",
+    )
+    results_xlsx = tmp_path / "results.xlsx"
+    tracker_xlsx = tmp_path / "tracker.xlsx"
+    monkeypatch.setattr(config, "TRANSFERS_FILE", tmp_path / "transfers.xlsx")
+    monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.02)
+
+    stop_event = threading.Event()
+    stopped_campaigns = []
+
+    class FakeDograh:
+        def get_agent(self, agent_id):
+            return Agent(id=agent_id, name="Danial", version_status="published")
+
+        def get_required_variables(self, agent_id):
+            return set()
+
+        def upload_csv(self, rows, file_name):
+            return "file-key"
+
+        def create_campaign(self, name, agent_id, file_key):
+            return {"id": 88, "name": name}
+
+        def start_campaign(self, cid):
+            pass
+
+        def get_campaign(self, cid):
+            stop_event.set()
+            return {"id": cid, "state": "running", "retry_config": {"enabled": False}}
+
+        def get_campaign_runs(self, cid):
+            return []
+
+        def stop_campaign(self, cid):
+            stopped_campaigns.append(cid)
+            return "paused"
+
+        def close(self):
+            pass
+
+    class FakeDecider:
+        def __init__(self, services, threshold, api_key, model):
+            self.services = services
+
+        async def decide(self, lead):
+            return Decision(
+                probabilities={"draftliner": 0.91},
+                service=self.services[0],
+                probability=0.91,
+                threshold=0.80,
+                model="gemini-3.8-flash",
+            )
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("pipeline.DograhClient", FakeDograh)
+    monkeypatch.setattr("pipeline.DecisionMaker", FakeDecider)
+
+    async def run():
+        async with LeadPipeline(
+            results_file=results_xlsx,
+            services_file=services_yaml,
+            tracker_file=tracker_xlsx,
+            stop_event=stop_event,
+        ) as p:
+            await p.submit({"company": "Stop Me Co", "phone": "(512) 555-0102"})
+            return p.stats
+
+    stats = asyncio.run(run())
+    assert 88 in stopped_campaigns
+    assert stats["interrupted"] == 1
+
+    from openpyxl import load_workbook
+    wb = load_workbook(tracker_xlsx, read_only=True, data_only=True)
+    try:
+        rows = list(wb["leads"].iter_rows(values_only=True))
+        header = rows[0]
+        row = dict(zip(header, rows[1]))
+        assert row["stage"] == "interrupted"
+        assert row["status_detail"] == "Stopped from dashboard"
+    finally:
+        wb.close()
+
+
+def test_close_drains_pending_results_when_join_interrupted(tmp_path, monkeypatch):
+    services_yaml = tmp_path / "services.yaml"
+    services_yaml.write_text(
+        "services:\n"
+        "  - id: draftliner\n"
+        "    name: Draftliner\n"
+        "    agent_id: 2\n"
+        "    description: AEC staffing\n",
+        encoding="utf-8",
+    )
+    results_xlsx = tmp_path / "results.xlsx"
+
+    class FakeDecider:
+        def __init__(self, services, threshold, api_key, model):
+            self.services = services
+
+        async def decide(self, lead):
+            return Decision(probabilities={"draftliner": 0.1}, service=None, probability=0.1)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("pipeline.DecisionMaker", FakeDecider)
+
+    async def run():
+        p = LeadPipeline(
+            results_file=results_xlsx,
+            services_file=services_yaml,
+            score_only=True,
+            tracker_file=tmp_path / "tracker.xlsx",
+        )
+        await p.start()
+        await p._results_q.put((
+            {"processed_at": "2026-11-23 12:00:00", "status": "not_interested", "phone_e164": "+15125550177"},
+            {"company": "Drained Co"},
+        ))
+
+        async def interrupt_join():
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(p._results_q, "join", interrupt_join)
+        await p.close(abort=True)
+
+    asyncio.run(run())
+    from openpyxl import load_workbook
+    wb = load_workbook(results_xlsx, read_only=True, data_only=True)
+    try:
+        rows = list(wb.active.iter_rows(values_only=True))
+        assert any("Drained Co" in map(str, r) for r in rows)
+    finally:
+        wb.close()

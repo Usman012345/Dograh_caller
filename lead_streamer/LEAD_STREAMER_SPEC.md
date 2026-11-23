@@ -289,7 +289,7 @@ Headers: `Authorization: Bearer <STREAM_TOKEN>`
 | Unknown path | `404 {"status":"error","error":"not_found"}` |
 | Method other than `GET` on a known path | `405 {"status":"error","error":"method_not_allowed"}` with an `Allow: GET` header |
 | A request body | Ignored; never read beyond 0 bytes. |
-| Query strings | Ignored. The caller can't change the batch size. |
+| Query strings | Ignored on `/health` and `/stats`. On `/leads/next`, optional `?limit=` (or `?batch_size=`) `1..1000` overrides `BATCH_SIZE` for that ping (values `> 1000` clamp to `1000`); invalid values (`< 1` or non-integer) return `400 {"status":"error","error":"bad_request"}`. |
 
 ---
 
@@ -297,7 +297,7 @@ Headers: `Authorization: Bearer <STREAM_TOKEN>`
 
 Each item in `leads` is one flat JSON object. The **dograh caller uses it as-is**:
 - its number verifier scans every field whose name contains "phone",
-- Jev reads the descriptive fields,
+- Gemini reads the descriptive fields,
 - every field becomes a variable available to the voice agent.
 
 So field names MUST be stable, lowercase `snake_case`.
@@ -632,9 +632,9 @@ The dograh caller is a separate project; this section is the agreement it must f
 
 1. Call `GET <PUBLIC_BASE_URL>/leads/next` with `Authorization: Bearer <STREAM_TOKEN>`.
 2. On `"status": "ok"`: submit every item of `leads` to its pipeline. Each item is a ready-made lead dict with `phone` / `phones`.
-3. After it has finished processing that batch, **wait for a person to confirm**, then ping again. The caller never pings again on its own (`pull_leads.py`: Enter = next ping, `q` = quit).
-4. On `"status": "no_new_leads"`: report it and wait for a person before pinging again.
-5. On `503`: report `retry_after_seconds` and wait for a person before pinging again. On `401` / `421`: stop and alert a person, because that is a configuration problem.
+3. Finish processing that batch before pinging again. In automatic mode (`python main.py`) the caller then pings on its own, after confirming `GET /health` reports `alive`. In manual mode (`python pull_leads.py`) it waits for a person (Enter = next ping, `q` = quit).
+4. On `"status": "no_new_leads"`: report it, then check again on a timer (automatic, default 60 s) or wait for a person (manual).
+5. On `503`: wait at least `retry_after_seconds` before pinging again (automatic) or wait for a person (manual). On `401` / `421`: stop and alert a person, because that is a configuration problem.
 6. Use `lead_id` + `content_version` to recognise a lead; an `event: "updated"` lead was sent before. Whether to call an updated lead again is the caller's decision.
 7. Never ping in parallel. Pings are processed one at a time anyway.
 8. Use a request timeout of at least **120 s**, and send `Accept-Encoding: gzip`. Most HTTP libraries do the latter by default. A full batch is 300 leads, about 0.7–1 MB of JSON before compression (1,000 leads: 2–3 MB).

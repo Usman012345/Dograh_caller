@@ -1,6 +1,6 @@
 # dograh_caller — Project Documentation
 
-> Quick start: [README.md](README.md) · Describing services for Jev: [SERVICES.md](SERVICES.md)
+> Quick start: [README.md](README.md) · Describing services for Gemini: [SERVICES.md](SERVICES.md)
 
 ## Contents
 
@@ -10,7 +10,7 @@
 4. [Installation and configuration](#4-installation-and-configuration)
 5. [Running the pipeline](#5-running-the-pipeline)
 6. [Stage 1 — Number verifier](#6-stage-1--number-verifier)
-7. [Stage 2 — Decision maker (Jev)](#7-stage-2--decision-maker-jev)
+7. [Stage 2 — Decision maker (Gemini)](#7-stage-2--decision-maker-gemini)
 8. [Stage 3 — Campaigns](#8-stage-3--campaigns)
 9. [Stage 4 — Results spreadsheet](#9-stage-4--results-spreadsheet)
 10. [Concurrency model](#10-concurrency-model)
@@ -25,9 +25,9 @@
 ## 1. Purpose
 
 `dograh_caller` takes business leads (scraped from the web or listed in a
-spreadsheet), decides with the **Jev** model which of our services each lead is
-likely to buy, and has the matching **Dograh** voice agent call the interested
-ones. Every lead and its outcome is recorded in an Excel sheet.
+spreadsheet), decides with **Gemini** (`gemini-3.8-flash`) which of our services each lead is
+likely to buy, and has the matching **Dograh** voice agent call the qualified
+ones. Every lead and its outcome is recorded in Excel (`call_results.xlsx` and `pipeline_tracker.xlsx`).
 
 | Service | Dograh agent | Status |
 |---|---|---|
@@ -43,10 +43,10 @@ ones. Every lead and its outcome is recorded in an Excel sheet.
   AI-powered     │                               dograh_caller                               │
   scraper  ──┐   │                                                                           │
   (dicts)    ├──►│  Number verifier ──► Decision maker ──► per-service lists ──► Campaigns   │
-  .xlsx /    │   │   US numbers only     Jev: P(interested)   Draftliner: [...]   one per    │
-  .csv /   ──┘   │   dedupe, E.164       per service ≥ 85%    Paradise:   [...]   service    │
+  .xlsx /    │   │   US numbers only     Gemini: P(fit)       Draftliner: [...]   one per    │
+  .csv /   ──┘   │   dedupe, E.164       per service ≥ 80%    Paradise:   [...]   service    │
   .json          │        │                    │                                    │        │
-                 │        └── dropped ─────────┴── not interested ──────── outcome ─┘        │──► output/call_results.xlsx
+                 │        └── dropped ─────────┴── not interested ──────── outcome ─┘        │──► output/call_results.xlsx & pipeline_tracker.xlsx
                  └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,9 +55,9 @@ ones. Every lead and its outcome is recorded in an Excel sheet.
 1. Leads (`dict`s) are submitted.
 2. The **verifier** finds the phone field, validates it and keeps it only if it
    is a valid, not-yet-seen US number. Otherwise → row with `dropped_*` status.
-3. The **decision maker** asks Jev one yes/no question per enabled service. If the
-   highest probability is ≥ the threshold (85%), the lead is added to that
-   service's list. Otherwise → row with `not_interested`.
+3. The **decision maker** asks Gemini for a probability and reason per enabled service
+   plus a two-line summary. Code checks the highest probability: if ≥ the threshold (80%),
+   the lead is added to that service's list. Otherwise → row with `not_interested` (shown as Non-Qualified in the dashboard).
 4. When all leads are scored, **one Dograh campaign per service** that has
    interested leads is created automatically, named `<service name>_<date>`
    (e.g. `Draftliner_2026-11-19`), using that service's agent and containing only
@@ -74,20 +74,24 @@ Campaigns appear on the Dograh dashboard under **Campaigns**.
 
 ```
 dograh_caller/
-├── main.py              Command-line entry point (reads .xlsx / .csv / .json)
-├── pull_leads.py        Pulls 300-lead batches from the lead streamer; asks before every next ping
+├── main.py              Command-line entry point (reads .xlsx / .csv / .json, supports --score-only)
+├── pull_leads.py        Pulls 300-lead batches from the lead streamer (automatic via main.py, or manual)
+├── dashboard_server.py  FastAPI + React dashboard server (monitoring and Start/Stop batch runner)
 ├── install.sh           Server setup: .venv, requirements, `pull_leads.py --check`
 ├── GO_LIVE.md           Steps to put https://ai-sdr.grobots.ai live (streamer, nginx, DNS, certbot)
-├── requirements-dev.txt Test dependencies (pytest, psycopg for the streamer tests)
+├── requirements-dev.txt Test dependencies (pytest, httpx, psycopg for the streamer tests)
 ├── pipeline.py          LeadPipeline: queues, workers, logging, summary
+├── pipeline_tracker.py  Per-lead Excel tracker (output/pipeline_tracker.xlsx)
 ├── lead_fields.py       Reading unstructured leads (field-name words, nesting, JSON text)
 ├── number_verifier.py   Stage 1 – phone validation (US only, never fax)
-├── decision_maker.py    Stage 2 – Jev questions, service loading
+├── decision_maker.py    Stage 2 – Gemini scoring, service loading
 ├── campaign_manager.py  Stage 3 – one campaign per service: create, start, follow calls
 ├── dograh_client.py     Dograh HTTP client (agents, CSV upload, campaigns, runs)
 ├── results_store.py     Stage 4 – .xlsx writer
 ├── config.py            All settings (read from .env / environment)
-├── services.yaml        Our services, as described to Jev  ← edit this to add services
+├── services.yaml        Our services, as described to Gemini  ← edit this to add services
+├── dashboard/           Dashboard backend (data.py, app.py, media.py, demo_media.py) and React frontend (web/ -> static/)
+├── tools/               Helper scripts (make_demo_tracker.py, compare_scores.py)
 ├── requirements.txt
 ├── README.md            Quick start
 ├── SERVICES.md          How to write service descriptions
@@ -110,7 +114,7 @@ dograh_caller/
 
 - Python 3.10+
 - `pip install -r requirements.txt`
-  (`typesafe-sdk`, `phonenumbers`, `requests`, `openpyxl`, `PyYAML`, `python-dotenv`)
+  (`google-genai`, `phonenumbers`, `requests`, `openpyxl`, `PyYAML`, `python-dotenv`, `fastapi`, `uvicorn`)
 
 ### `.env`
 
@@ -119,7 +123,7 @@ Settings are read from, in priority order: real environment variables →
 
 ```ini
 # Required
-Jev_Key=...                       # TypeSafe / Jev API key (TYPESAFE_API_KEY also accepted)
+GEMINI_API_KEY=...                # Gemini API key (GEMINI_API also accepted)
 DOGRAH_API_KEY=...                # Dograh: Settings -> API Keys (same deployment as the URL)
 DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 ```
@@ -128,11 +132,14 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `Jev_Key` / `TYPESAFE_API_KEY` | — | Jev API key (required) |
-| `JEV_MODEL` | `jev-1.14.0` | Jev model; pinned so behaviour doesn't change silently (`jev-latest` moves) |
-| `JEV_MAX_FIELD_CHARS` | `2000` | Longest value Jev gets from one field (longer text is cut) |
-| `JEV_MAX_STATE_CHARS` | `12000` | Most characters Jev gets per lead in total (most useful fields first) |
-| `INTEREST_THRESHOLD` | `0.85` | Minimum probability for a lead to be called |
+| `GEMINI_API_KEY` / `GEMINI_API` | — | Gemini API key (required) |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model for lead qualification |
+| `GEMINI_THINKING_LEVEL` | `MEDIUM` | Reasoning level (`LOW`, `MEDIUM`, or `HIGH`) |
+| `GEMINI_TIMEOUT_SECONDS` | `60` | HTTP timeout for Gemini requests |
+| `GEMINI_MAX_ATTEMPTS` | `4` | Retry attempts for transient Gemini HTTP errors |
+| `LEAD_MAX_FIELD_CHARS` | `2000` | Longest value Gemini gets from one field (longer text is cut) |
+| `LEAD_MAX_STATE_CHARS` | `12000` | Most characters Gemini gets per lead in total (most useful fields first) |
+| `INTEREST_THRESHOLD` | `0.80` | Minimum probability for a lead to be qualified/called |
 | `ALLOWED_PHONE_REGIONS` | `US` | Phone regions accepted, comma-separated ISO codes. `US,PR,VI,GU,MP,AS` adds the US territories |
 | `SKIP_ALREADY_CALLED` | `true` | Block numbers already called in earlier runs (read from the results sheet) |
 | `SERVICES_FILE` | `services.yaml` | Service definitions |
@@ -149,10 +156,16 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 | `CAMPAIGN_IDLE_TIMEOUT_SECONDS` | `900` | If a campaign makes no progress for this long, its unfinished leads become `call_timeout` |
 | `RESULT_WAIT_SECONDS` | `20` | After a call ends, wait this long for Dograh to fill in the outcome |
 | `RETRY_GRACE_SECONDS` | `120` | Extra wait beyond the retry delay for a retry call to appear |
-| `DECISION_CONCURRENCY` | `8` | Parallel Jev requests |
+| `DECISION_CONCURRENCY` | `8` | Parallel Gemini requests |
 | `LEAD_BATCH_SIZE` | `300` | Leads per batch; each batch is scored, put into campaigns and fully called before the next. Keep equal to the streamer's `BATCH_SIZE` |
 | `QUEUE_MAXSIZE` | `100` | Max leads waiting between two stages |
 | `RESULTS_FILE` | `output/call_results.xlsx` | Results spreadsheet |
+| `PIPELINE_TRACKER_FILE` | `output/pipeline_tracker.xlsx` | Per-lead Excel pipeline tracker |
+| `TRACKER_SAVE_SECONDS` | `3` | Minimum interval between periodic tracker saves |
+| `TRACKER_WARN_ROWS` | `20000` | Row count at which tracker logs a size warning |
+| `DASHBOARD_HOST` | `127.0.0.1` | Default host for `dashboard_server.py` |
+| `DASHBOARD_PORT` | `8090` | Default port for `dashboard_server.py` |
+| `DASHBOARD_REFRESH_SECONDS` | `5` | Dashboard polling interval |
 | `TRANSFERS_FILE` | `output/transferred_calls.xlsx` | Only businesses whose call was transferred, with their details |
 | `TRANSFER_DISPOSITIONS` | `transfer_call,call_transferred` | Dispositions/tags that mean "transferred" (Dograh's defaults). Add the disposition you set on a transfer tool if it doesn't contain "transfer". Anything containing "transfer" but not "fail" also counts |
 | `LEAD_SOURCE_URL` | `https://ai-sdr.grobots.ai` | Lead streamer address pinged by `pull_leads.py` (`<url>/leads/next`) |
@@ -172,10 +185,12 @@ Every run is **live**: leads that pass the threshold are called.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json). Relative paths are relative to `dograh_caller/`. Empty by default on purpose: every run is live, so with no input set `python main.py` stops with "No input set" before contacting Jev or Dograh. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
+| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json) called when `python main.py` starts. Relative paths are relative to `dograh_caller/`. `None` = streamer only. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
 | `INPUT_SHEET` | `None` | Worksheet to read (`None` = first sheet) |
 | `INPUT_LEADS` | `[]` | Lead dicts, e.g. from the scraper. Processed together with the file if both are set. |
-| `LIMIT` | `None` | Process only the first N leads |
+| `LIMIT` | `None` | Process only the first N leads of the file |
+| `USE_STREAMER` | `True` | After the file, keep pulling batches from the lead streamer. `False` = process the file and exit |
+| `STREAMER_CHECK_SECONDS` | `60` | Wait between streamer checks while it is not attached or has no new leads |
 
 ### From other code: `run()`
 
@@ -191,16 +206,17 @@ Returns `0` on success, `1` on error, `130` if interrupted.
 ### Command-line overrides (optional)
 
 ```bash
-python main.py [file] [--threshold 0.9] [--output path.xlsx] [--sheet NAME] [--limit N]
+python main.py [file] [--threshold 0.9] [--output path.xlsx] [--sheet NAME] [--limit N] [--score-only]
 ```
 
 | Option | Effect |
 |---|---|
-| `file` | Use this file instead of `INPUT_FILE_PATH` / `INPUT_LEADS` |
+| `file` | Use this file once instead of `INPUT_FILE_PATH` / `INPUT_LEADS`, without using the streamer |
 | `--threshold` | Override `INTEREST_THRESHOLD` for this run (0–1) |
 | `--output` | Write results to another .xlsx |
 | `--sheet` | Worksheet to read (default: `INPUT_SHEET` or first sheet) |
 | `--limit` | Process only the first N leads (overrides `LIMIT`) |
+| `--score-only` | Verify and score with Gemini without creating Dograh campaigns or placing calls (outputs `output/score_only_<timestamp>.xlsx`) |
 
 **Input files**
 
@@ -215,11 +231,11 @@ Any columns are allowed; one must contain the phone number (see §6).
 
 ```
 [23:47:01] setup    Services: Draftliner (agent 2)
-[23:47:01] setup    Jev model jev-1.14.0, call threshold 85%
+[23:47:01] setup    Gemini model gemini-3.8-flash (thinking MEDIUM), threshold 80%
 [23:47:02] setup    Draftliner -> agent 2 'Testing Lead qualification - outbound'
 [23:47:02] verify   DROP +1 416 555 0107 (dropped_not_us (CA)) - Maple Leaf Builders
-[23:47:03] decide   SKIP +16025550105 Taco Loco - not interested (draftliner 2%)
-[23:47:03] decide   PASS +12155550103 Keystone MEP Engineers -> Draftliner (draftliner 94%)
+[23:47:03] decide   NON-QUALIFIED +16025550105 Taco Loco (draftliner 2%)
+[23:47:03] decide   QUALIFIED +12155550103 Keystone MEP Engineers -> Draftliner (draftliner 94%)
 [23:47:29] call     -> Calling +12155550103 (Keystone MEP Engineers) via 'Testing Lead ...' [run 2201]
 [23:48:41] call     <- +12155550103 Result: user_qualified | 67s | tags: user_qualified, user_speech
 Done. Leads received: 10 | dropped by verifier: 4 | not interested: 2 | called: 4 | ...
@@ -319,11 +335,11 @@ have no location and are left blank.
 
 ---
 
-## 7. Stage 2 — Decision maker (Jev)
+## 7. Stage 2 — Decision maker (Gemini)
 
 File: [decision_maker.py](decision_maker.py) · Class: `DecisionMaker`
 
-### What Jev sees
+### What Gemini sees
 
 **State:** only the information that describes the business, built by
 `lead_state()` from the unstructured lead:
@@ -339,40 +355,32 @@ File: [decision_maker.py](decision_maker.py) · Class: `DecisionMaker`
 
 - Nested fields are flattened to `parent > child` (e.g. `business > about`);
   repeated fields from lists are joined with `;`.
-- Each value is cut to `JEV_MAX_FIELD_CHARS` (2,000) and the whole state to
-  `JEV_MAX_STATE_CHARS` (12,000), filling in the order above — so a 40,000-
-  character tender description can't crowd out the rest or exceed Jev's limits.
+- Each value is cut to `LEAD_MAX_FIELD_CHARS` (2,000) and the whole state to
+  `LEAD_MAX_STATE_CHARS` (12,000), filling in the order above — so a 40,000-
+  character tender description can't crowd out the rest.
 - Example: a 41,000-character streamer lead becomes ~2,500 characters of
   company, category, services, description (capped), size and location.
 
-**Questions:** one `Noul` (yes/no) question per enabled service:
-  - *instructions:* "Decide whether [the lead] is realistically a potential
-    customer that would be interested in `<name>`'s services…" + the service's
-    `description`;
-  - *criteria:* `true` = the service's `good_fit`, `false` = its `not_a_fit`.
-
-All services are asked in a **single** Jev request per lead (~1–2 s, a few
-hundred input tokens, output free).
+**Structured scoring:** one Gemini request per lead (`gemini-3.8-flash`, reasoning
+level `GEMINI_THINKING_LEVEL`) evaluates every enabled service from `services.yaml`
+and returns a structured JSON object with:
+- `services`: for each service, an integer `probability_percent` (0–100) and a
+  one-sentence `reason` citing evidence from the lead;
+- `summary`: a two-short-sentence explanation of what the business does and why
+  it does or does not fit its best-matching service.
 
 ### Routing rule
 
 ```
-best = service with the highest probability
+best = service with the highest probability (ties broken by services.yaml order)
 if probability(best) >= INTEREST_THRESHOLD: call via best.agent_id
 else: not_interested
 ```
 
-One lead is called at most once, by one agent. Every service's probability is
-saved as a `prob_<id>` column.
-
-### Why Jev
-
-Jev returns a probability per question instead of generated text, so outputs
-always match the expected type (no parsing, no invented answers) and the
-probabilities can be thresholded. Its probabilities are meant to be calibrated;
-validate this by labelling ~100–200 real leads by hand, running them,
-comparing the `prob_*` columns with the call outcomes, and tuning
-`INTEREST_THRESHOLD` against the results.
+Code applies the threshold (Gemini is not told the cutoff) and generates the
+`verdict` text. One lead is called at most once, by one agent. Every service's
+probability is saved as `prob_<id>`, its reason as `decision_reason_<id>`, and
+full per-lead reasoning is persisted in `output/pipeline_tracker.xlsx`.
 
 ---
 
@@ -467,7 +475,7 @@ replaced by `_` (`"Company Name"` → `company_name`), plus:
 | Variable | Value |
 |---|---|
 | `phone_number` | E.164 number being called |
-| `interested_service` | Service name Jev chose, e.g. `Draftliner` |
+| `interested_service` | Service name Gemini qualified, e.g. `Draftliner` |
 | `current_datetime` | Local time, e.g. `Wednesday, November 18, 2026, 11:47 PM` |
 | `lead_ref` | Internal ID used to match calls to leads |
 
@@ -530,8 +538,10 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | `phone_raw` | Phone as received |
 | `phone_e164` | Normalized phone |
 | `phone_location`, `phone_timezone` | US state and time zone of the number's area code |
-| `interested_service` | Service chosen by Jev (empty if none passed) |
+| `interested_service` | Qualified service chosen by code (empty if none passed) |
 | `interest_probability` | Highest probability across services |
+| `decision_verdict`, `decision_summary` | Code-generated verdict and Gemini two-line summary |
+| `decision_reason_<service_id>` | One-sentence reason per service |
 | `agent_id`, `agent_name` | Dograh agent used for the call |
 | `campaign_id`, `campaign_name` | Dograh campaign the number was dialed in (e.g. `Draftliner_2026-11-19`) |
 | `dograh_run_id` | Run ID of the last call attempt (look it up under *Agent Runs*) |
@@ -540,7 +550,7 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | `call_transferred` | TRUE when the agent transferred the call; the business is also in `TRANSFERS_FILE` |
 | `transcript_url`, `recording_url` | Call artifacts |
 | `dograh_response` | Full Dograh run as JSON (cut at Excel's 32k-character cell limit) |
-| `prob_<service_id>` | Jev probability for each service |
+| `prob_<service_id>` | Gemini probability for each service |
 | `other_lead_fields` | Lead fields beyond the column limit (JSON) |
 | *lead fields* | Original fields; stored as `lead.<name>` if the name is one of the columns above |
 
@@ -549,12 +559,13 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | Status | Meaning |
 |---|---|
 | `dropped_no_phone` / `dropped_unreadable_number` / `dropped_invalid_number` / `dropped_not_us (XX)` / `dropped_special_number (TYPE)` / `dropped_fax_only` / `dropped_already_called` / `dropped_duplicate` | Rejected by the verifier (§6) |
-| `not_interested` | No service reached the threshold |
+| `not_interested` | No service reached the threshold (shown as Non-Qualified in the dashboard) |
+| `scored_qualified` | Qualified in a `--score-only` run; no call placed |
 | `called` | Call completed; see disposition |
 | `skipped_missing_data` | Left out of its campaign because it has no value for a `{{variable}}` the agent's prompt uses (Dograh would otherwise refuse the whole campaign) |
 | `call_failed` | Campaign couldn't be created/started, the number was never dialed (including before an idle timeout), or Dograh couldn't be reached |
 | `call_timeout` | A dialed call never finished before `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without campaign progress |
-| `decision_error` | Jev request failed (network, key, rate limit after retries) |
+| `decision_error` | Gemini request or validation failed after retries; lead is saved for retry |
 | `error` | Unexpected error in the verifier |
 
 ---
@@ -570,7 +581,7 @@ The pipeline is built on `asyncio` (see [pipeline.py](pipeline.py)):
 | Campaigns | one monitor task per campaign, all in parallel | per-service lists, launched by `flush()` / `close()` |
 | Results writer | 1 | `results` queue (unbounded) |
 
-- **Concurrent scoring:** leads are verified and scored by Jev while more are
+- **Concurrent scoring:** leads are verified and scored by Gemini while more are
   still being submitted.
 - **Back-pressure:** bounded queues make `submit()` wait when scoring falls
   behind, so memory use stays bounded.
@@ -578,7 +589,7 @@ The pipeline is built on `asyncio` (see [pipeline.py](pipeline.py)):
   share the organization's concurrent-call limit (currently 1, roughly one call
   per minute).
 - **Blocking HTTP** (Dograh via `requests`) runs in worker threads
-  (`asyncio.to_thread`); Jev uses its native async client.
+  (`asyncio.to_thread`); Gemini uses its async `client.aio` API.
 - **Shutdown:** `close()` runs `flush()` (score everything, run the campaigns,
   wait for all calls), then stops the workers, pauses any campaign of this run
   still running, saves the sheet and prints the summary. On `Ctrl+C` or an error
@@ -624,26 +635,31 @@ run_leads_sync(leads, **pipeline_kwargs)    # blocking version for normal script
 
 ### Scraper integration
 
-**Lead streamer (live setup).** `python pull_leads.py` pings
+**Lead streamer (live setup).** `python main.py` first runs `INPUT_FILE_PATH`, then runs
+unattended. It confirms `GET /health` reports the real streamer (no token is sent), pings
 `GET https://ai-sdr.grobots.ai/leads/next` (`Authorization: Bearer <LEAD_SOURCE_TOKEN>`),
-gets one batch of up to 300 leads, saves it to `PULLED_BATCHES_DIR`, runs it
-through `run_leads()` until every call is finished, and then waits for a person
-(Enter = next ping, `q` = quit). It never pings again without that input.
+gets one batch of up to 300 leads, saves it to `PULLED_BATCHES_DIR`, runs it through
+`run_leads()` until every call is finished, and takes the next batch. `python pull_leads.py`
+is the manual alternative: it asks a person (Enter = next ping, `q` = quit) instead of continuing.
 
-| Streamer answer | What `pull_leads.py` does |
-|---|---|
-| `200 "ok"` + leads | save → process fully → ask |
-| `200 "no_new_leads"` | say so → ask |
-| `503` busy / database down | show `retry_after_seconds` → ask |
-| `404`, an HTML page, network error, timeout | explain → ask |
-| `401` token / `421` host | stop (exit code 2): configuration problem |
+| Streamer answer | `python main.py` (automatic) | `python pull_leads.py` (manual) |
+|---|---|---|
+| `/health` is not the live streamer | wait, check again | not checked before a ping |
+| `200 "ok"` + leads | save → process fully → next ping | save → process fully → ask |
+| `200 "no_new_leads"` | check again every `STREAMER_CHECK_SECONDS` | say so → ask |
+| `503` busy / database down | wait for `retry_after_seconds` or the check interval, whichever is longer | show it → ask |
+| `404`, an HTML page, network error, timeout | explain once → check again | explain → ask |
+| `401` token / `421` host | stop (exit code 2): configuration problem | stop (exit code 2) |
 
-Before the first ping it checks the Jev key, `services.yaml` and each Dograh
+In automatic mode an unfinished batch is always completed before new leads are taken, and
+failed batches or failed Gemini scoring retry with a growing wait, up to one hour.
+
+Before the first ping it checks the Gemini key and model access, `services.yaml` and each Dograh
 agent, so no leads are taken while the caller can't use them. `python pull_leads.py --check` runs
 the same checks plus the streamer's `/health` and `/stats` (token) and exits
 without taking any leads. SIGTERM and SIGHUP (kill, a dropped SSH session) are
 handled like Ctrl+C: campaigns are paused and the batch is kept. An interrupted batch
-(`*.pending.json`) is offered again at the next start. The streamer's side of
+(`*.pending.json`) is continued (automatic) or offered (manual) at the next start. The streamer's side of
 this agreement is in [lead_streamer/LEAD_STREAMER_SPEC.md](lead_streamer/LEAD_STREAMER_SPEC.md) §7, §12, §16.
 
 **In-process.**
@@ -664,8 +680,8 @@ from number_verifier import NumberVerifier
 NumberVerifier().verify({"phone": "(512) 555-0101"})   # Verification(ok=True, e164='+15125550101', ...)
 
 from decision_maker import DecisionMaker, load_services
-dm = DecisionMaker(load_services(path), 0.85, api_key, "jev-1.14.0")
-decision = await dm.decide(lead)                       # decision.probabilities, decision.service
+dm = DecisionMaker(load_services(path), 0.80, api_key, "gemini-3.8-flash")
+decision = await dm.decide(lead)                       # decision.probabilities, decision.service, decision.summary
 
 from dograh_client import DograhClient
 from campaign_manager import CampaignJob, CampaignLead
@@ -699,13 +715,13 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 | Symptom | Cause / fix |
 |---|---|
-| `Jev API key not found` | Add `Jev_Key=...` (or `TYPESAFE_API_KEY`) to `.env`. |
+| `Gemini API key not found` | Add `GEMINI_API_KEY=...` (or `GEMINI_API=...`) to `.env`. |
 | `Dograh API key not found` | Add `DOGRAH_API_KEY=...` to `.env`. |
 | `Dograh rejected the API key (HTTP 401)` | Key was created in a different Dograh deployment than `DOGRAH_BASE_URL`, or it was archived. |
 | `Dograh agent N does not exist` | Wrong `agent_id` in services.yaml (see the ID column on Dograh's *Voice Agents* page). |
 | Startup warning `has unpublished changes` | The agent has edits saved as a draft. Calls use the last **published** version — publish the agent in Dograh. |
 | Every lead is `not_interested` | Service descriptions too narrow, threshold too high, or leads lack descriptive fields. Check the `prob_*` columns in the results. |
-| Many `decision_error` rows | Jev rate limit or network issue; lower `DECISION_CONCURRENCY`. |
+| Many `decision_error` rows | Gemini rate limit or network issue; lower `DECISION_CONCURRENCY`. Failed leads are saved for retry (`decision_retry_*`). |
 | `FAILED to start '<service>_<date>'` | Dograh refused the campaign; the message says why (telephony not configured, quota, invalid CSV, ...). |
 | Leads marked `skipped_missing_data` | The agent's prompt uses a `{{variable}}` those leads have no value for. Add the field to the leads, give the variable a default in the prompt (`{{company | there}}`), or remove it. |
 | Calls stay on "Calling…" for a long time | Normal while the conversation lasts. If calls never finish, Dograh is not receiving the telephony provider's status callbacks — check the deployment's public backend URL. Unfinished dialed leads end as `call_timeout` (and undialed leads as `call_failed`) after `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without progress. |
@@ -732,8 +748,9 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 - **No voicemail detection** in this project; it must be handled by the Dograh
   agent or telephony provider.
 - **US only.** By design, all non-US numbers are dropped.
-- **Jev is in early access.** Availability, limits and pricing may change;
-  the model version is pinned in `JEV_MODEL`.
+- **Gemini model pinning.** The model defaults to `GEMINI_MODEL=gemini-3.8-flash`
+  with `GEMINI_THINKING_LEVEL=MEDIUM`. Failed scoring requests are saved to
+  `decision_retry` files/batches rather than treated as non-qualified.
 
 ---
 

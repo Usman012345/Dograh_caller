@@ -1,25 +1,25 @@
-# Describing our services for Jev
+# Describing our services for Gemini
 
-Jev decides which service a lead might buy **only from the text in
+Gemini decides which service a lead might buy **only from the text in
 [`services.yaml`](services.yaml)**. Better descriptions mean better decisions.
 Adding, editing, or disabling a service never needs a code change.
 
 ## How a decision is made
 
-For every lead, Jev answers one yes/no question per **enabled** service:
+For every lead, Gemini scores every **enabled** service independently (0–100%):
 
-> *"Is this lead realistically a potential customer for `<name>`?"*
+> *"How likely is this business to be a genuine potential customer for `<name>`?"*
 
-and returns a probability (0–100%) for each. The lead is then:
+and returns a probability (0–100%) and one-sentence reason for each, plus a two-line summary. Code then applies the threshold:
 
 | Result | What happens |
 |---|---|
-| Best probability **≥ 85%** | Added to that service's campaign (`<name>_<date>`), called by its Dograh agent (`agent_id`) |
-| Two services ≥ 85% | Goes to the service with the **higher** probability (each lead is in one campaign only) |
-| All below 85% | Not called; saved as `not_interested` |
+| Best probability **≥ 80%** | Added to that service's campaign (`<name>_<date>`), called by its Dograh agent (`agent_id`) |
+| Two services ≥ 80% | Goes to the service with the **higher** probability (each lead is in one campaign only; ties use `services.yaml` order) |
+| All below 80% | Not called; saved as `not_interested` (shown as Non-Qualified in the dashboard) |
 
 All probabilities are saved in the results sheet as `prob_<id>` columns, so you
-can see how close each lead came. The 85% threshold is `INTEREST_THRESHOLD` in
+can see how close each lead came. The 80% threshold is `INTEREST_THRESHOLD` in
 `.env` / `config.py`, or `--threshold` on the command line.
 
 ## Fields
@@ -27,7 +27,7 @@ can see how close each lead came. The 85% threshold is `INTEREST_THRESHOLD` in
 ```yaml
   - id: draftliner          # unique, lowercase letters/digits/_ ; becomes the prob_<id> column
     name: Draftliner        # human-readable name, also sent to the agent as {{interested_service}}
-    enabled: true           # false = ignored by Jev, never called
+    enabled: true           # false = ignored by Gemini, never called
     agent_id: 2             # Dograh agent ID (Voice Agents page, "ID" column)
     description: |          # REQUIRED - what the company sells
       ...
@@ -51,14 +51,13 @@ can see how close each lead came. The 85% threshold is `INTEREST_THRESHOLD` in
 - **Describe the buyer, not just the product.** `good_fit` should name the kinds
   of businesses (categories, trades, sizes) that buy, plus signals in a listing
   that suggest a need ("bids on projects", "growing", "uses Revit").
-- **Say who is NOT a fit.** Jev uses `not_a_fit` to push clear mismatches toward
+- **Say who is NOT a fit.** Gemini uses `not_a_fit` to push clear mismatches toward
   0%. List the near-misses that waste calls (e.g. homeowners, real estate agents).
 - **Use the words scrapers produce.** If listings say "GC", "remodeler",
   "MEP", include those terms.
 - **Keep services distinct.** If two services overlap (e.g. both do estimating),
   state in each `good_fit` what makes a lead lean to one rather than the other.
-- **Keep it factual and reasonably short.** A few paragraphs is plenty; Jev's
-  limit is ~32k tokens per question, far above what's needed.
+- **Keep it factual and reasonably short.** A few paragraphs is plenty.
 
 ## Current services and how they are separated
 
@@ -72,11 +71,11 @@ to the other one (small trade crews → Paradise; architects/engineers → Draft
 Descriptions were written from `Draftliner_knowledgebase.docx` and
 `Paradise_Estimating_AI_Knowledge_Base.pdf`.
 
-Scores measured on test leads with these descriptions:
+Example score ranges by lead type:
 
 | Lead type | Draftliner | Paradise |
 |---|---|---|
 | Architecture / MEP engineering firm | 0.94 | 0.08–0.13 |
-| Steel fabricator (shop drawings), custom-home builder, developer | 0.88–0.92 | 0.80–0.85 |
+| Steel fabricator (shop drawings), custom-home builder, developer | 0.88–0.92 | 0.80–0.84 |
 | Drywall / roofing / concrete / masonry / HVAC / electrical contractor | 0.14–0.52 | 0.86–0.95 |
 | Restaurant, handyman | 0.03–0.04 | 0.06–0.09 |

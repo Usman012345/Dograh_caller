@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -41,6 +42,7 @@ _UNKNOWN_DATE_LABEL = "unknown date"
 
 FIXED_COLUMNS: List[str] = [
     "processed_at",
+    "pipeline_lead_id",
     "status",                # dropped_* | not_interested | called | call_failed | call_timeout | ...
     "detail",
     "phone_raw",
@@ -49,6 +51,8 @@ FIXED_COLUMNS: List[str] = [
     "phone_timezone",        # e.g. America/Chicago - for calling-hours rules
     "interested_service",
     "interest_probability",
+    "decision_verdict",
+    "decision_summary",
     "agent_id",
     "agent_name",
     "campaign_id",
@@ -156,12 +160,17 @@ _DATE_FILL = PatternFill("solid", fgColor="E5E7EB")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def clean_excel_text(text: str) -> str:
+    """Replace characters disallowed in XML/Excel worksheets with spaces."""
+    return ILLEGAL_CHARACTERS_RE.sub(" ", text)
+
+
 def _cell(value: Any) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, (dict, list, tuple)):
         value = json.dumps(value, default=str, ensure_ascii=False)
-    text = str(value)
+    text = clean_excel_text(str(value))
     return text if len(text) <= EXCEL_CELL_LIMIT else text[:EXCEL_CELL_LIMIT] + "...[truncated]"
 
 
@@ -270,6 +279,8 @@ class ResultsStore:
                 continue
 
             day = _day_of(row_dict.get(self._time_col))
+            if not day and last_banner_day:
+                day = last_banner_day
             if last_banner_day is None or day != last_banner_day:
                 needs_rewrite = True
             self._groups.setdefault(day, []).append(row_dict)
@@ -306,6 +317,8 @@ class ResultsStore:
 
         for c, name in enumerate(self.columns, start=1):
             cell = ws.cell(row=1, column=c, value=name)
+            if isinstance(name, str) and name.startswith("="):
+                cell.data_type = "s"
             cell.font = _HEADER_FONT
             cell.fill = _HEADER_FILL
             ws.column_dimensions[get_column_letter(c)].width = max(14, min(len(name) + 4, 40))
@@ -324,14 +337,16 @@ class ResultsStore:
                 for c, name in enumerate(self.columns, start=1):
                     val = row_dict.get(name)
                     if val is not None:
-                        ws.cell(row=r, column=c, value=val)
+                        cell = ws.cell(row=r, column=c, value=val)
+                        if isinstance(val, str) and val.startswith("="):
+                            cell.data_type = "s"
                 r += 1
 
     # ------------------------------------------------------------------ lead fields
 
     def _is_own_column(self, name: str) -> bool:
         """Columns written by this program (not copied from the lead)."""
-        return name in self._fixed_set or name.startswith("prob_")
+        return name in self._fixed_set or name.startswith(("prob_", "decision_reason_"))
 
     def _lead_values(self, own: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -343,18 +358,26 @@ class ResultsStore:
             RESULTS_MAX_LEAD_COLUMNS lead columns; further new fields are kept
             together (as JSON) in the "other_lead_fields" column.
         """
-        lead_names = {str(k) for k in lead}
-        taken = set(own)
+        lead_names = {clean_excel_text(str(k)) for k in lead}
+        own_cols = set(own)
+        taken = set(own_cols)
         values: Dict[str, Any] = {}
         overflow: Dict[str, Any] = {}
         for key, value in lead.items():
-            name = str(key)
-            if self._is_own_column(name) or name in taken:
+            name = clean_excel_text(str(key))
+            if self._is_own_column(name) or name in own_cols:
                 n, candidate = 1, f"lead.{name}"
                 while (self._is_own_column(candidate) or candidate in taken
                        or (candidate in lead_names and candidate != name)):
                     n += 1
                     candidate = f"lead.{name}_{n}"
+                name = candidate
+            elif name in taken:
+                n, candidate = 2, f"{name}_2"
+                while (self._is_own_column(candidate) or candidate in taken
+                       or (candidate in lead_names and candidate != name)):
+                    n += 1
+                    candidate = f"{name}_{n}"
                 name = candidate
             taken.add(name)
 
@@ -379,7 +402,7 @@ class ResultsStore:
         if lead:
             row = {**row, **self._lead_values(row, lead)}
         existing = set(self.columns)
-        for name in row.keys():
+        for name in row:
             if name not in existing:
                 self.columns.append(name)
                 existing.add(name)

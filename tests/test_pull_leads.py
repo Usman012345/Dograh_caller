@@ -283,6 +283,150 @@ def test_preflight_requires_token(monkeypatch):
     assert "LEAD_SOURCE_TOKEN" in pull_leads.preflight()
 
 
+# ------------------------------------------------------------------ automatic mode
+
+class StopLoop:
+    """Records every wait and stops the endless loop after the scripted number of waits."""
+
+    def __init__(self, stop_after):
+        self.waits = []
+        self.stop_after = stop_after
+
+    def __call__(self, seconds):
+        self.waits.append(seconds)
+        if len(self.waits) >= self.stop_after:
+            raise KeyboardInterrupt
+
+
+def auto_puller(tmp_path, pings, process=None, events=None):
+    events = [] if events is None else events
+    pings = list(pings)
+
+    def must_not_ask(prompt):
+        raise AssertionError(f"automatic mode must never prompt: {prompt}")
+
+    def fake_ping(url, token, timeout):
+        events.append(("ping",))
+        return pings.pop(0)
+
+    def fake_process(leads):
+        events.append(("process", len(leads)))
+        return Counter(received=len(leads))
+
+    return Puller(source_url="https://ai-sdr.grobots.ai", token=TOKEN, timeout=180,
+                  store=BatchStore(tmp_path / "pulled"), process=process or fake_process,
+                  ask_fn=must_not_ask, ping_fn=fake_ping), events
+
+
+def test_auto_waits_for_proxy_then_processes_batches_without_a_person(tmp_path):
+    pings = [PingResult(BATCH, "Received 300", _leads(300)), PingResult(BATCH, "Received 20", _leads(20)),
+             PingResult(EMPTY, "No new Leads available")]
+    p, events = auto_puller(tmp_path, pings)
+    ready = iter([False, False, True, True, True])
+    sleep = StopLoop(3)
+    assert p.run_auto(60, ready_fn=lambda url: next(ready), sleep_fn=sleep) == 130
+    assert events == [("ping",), ("process", 300), ("ping",), ("process", 20), ("ping",)]
+    assert sleep.waits == [60, 60, 60]
+    assert p.batches_done == 2 and p.leads_done == 320
+    assert not p.store.unfinished()
+
+
+def test_auto_never_pings_until_the_real_streamer_answers(tmp_path):
+    p, events = auto_puller(tmp_path, [])
+    assert p.run_auto(60, ready_fn=lambda url: False, sleep_fn=StopLoop(4)) == 130
+    assert events == []
+
+
+def test_auto_finishes_saved_batches_before_taking_new_leads(tmp_path):
+    p, events = auto_puller(tmp_path, [PingResult(EMPTY, "No new Leads available")])
+    p.store.save(PingResult(BATCH, "x", _leads(7)), "earlier run")
+    assert p.run_auto(60, ready_fn=lambda url: True, sleep_fn=StopLoop(1)) == 130
+    assert events == [("process", 7), ("ping",)]
+
+
+def test_auto_keeps_a_failed_batch_and_takes_nothing_new(tmp_path):
+    calls = []
+
+    def flaky(leads):
+        calls.append(len(leads))
+        if len(calls) < 3:
+            raise RuntimeError("Dograh is down")
+        return Counter(received=len(leads))
+
+    p, events = auto_puller(tmp_path, [PingResult(EMPTY, "No new Leads available")], process=flaky)
+    p.store.save(PingResult(BATCH, "x", _leads(4)), "earlier run")
+    sleep = StopLoop(3)
+    assert p.run_auto(60, ready_fn=lambda url: True, sleep_fn=sleep) == 130
+    assert calls == [4, 4, 4]
+    assert sleep.waits == [60, 120, 60], "failures back off, then normal checks resume"
+    assert events == [("ping",)]
+
+
+def test_auto_backs_off_when_gemini_scoring_fails(tmp_path):
+    def failing_scores(leads):
+        p.store.save(PingResult(BATCH, "retry", leads), "decision_retry")
+        return Counter(decision_error=len(leads))
+
+    p, _events = auto_puller(tmp_path, [], process=failing_scores)
+    p.store.save(PingResult(BATCH, "x", _leads(2)), "earlier run")
+    sleep = StopLoop(3)
+    assert p.run_auto(60, ready_fn=lambda url: True, sleep_fn=sleep) == 130
+    assert sleep.waits == [60, 120, 240]
+    assert p.store.unfinished(), "failed leads stay saved"
+
+
+def test_auto_stops_on_a_token_or_host_problem(tmp_path, capsys):
+    p, events = auto_puller(tmp_path, [PingResult(FATAL, "The streamer rejected the token (HTTP 401).")])
+    assert p.run_auto(60, ready_fn=lambda url: True, sleep_fn=StopLoop(5)) == 2
+    assert events == [("ping",)]
+    assert "STOP" in capsys.readouterr().out
+
+
+def test_auto_respects_the_streamers_retry_after(tmp_path):
+    p, _events = auto_puller(tmp_path, [PingResult(RETRY, "busy", meta={"retry_after": 90})])
+    sleep = StopLoop(1)
+    assert p.run_auto(60, ready_fn=lambda url: True, sleep_fn=sleep) == 130
+    assert sleep.waits == [90]
+
+
+def test_auto_does_not_repeat_the_same_waiting_message(tmp_path, capsys):
+    p, _events = auto_puller(tmp_path, [])
+    p.run_auto(60, ready_fn=lambda url: False, sleep_fn=StopLoop(5))
+    assert capsys.readouterr().out.count("Waiting for the lead streamer") == 1
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (200, {"status": "alive", "database": "ok"}, True),
+    (200, {"status": "alive", "database": "busy"}, False),
+    (200, {"status": "ok"}, False),                       # the old receiver on this subdomain
+    (503, {"status": "alive", "database": "ok"}, False),
+])
+def test_streamer_ready_only_for_the_real_streamer(streamer, status, body, expected):
+    streamer.queue_json(status, body)
+    assert pull_leads.streamer_is_ready(streamer.url) is expected
+    assert streamer.requests[0]["path"] == "/health"
+    assert streamer.requests[0]["auth"] is None, "the token is never sent to an unconfirmed server"
+
+
+def test_streamer_ready_handles_web_pages_and_no_connection(streamer):
+    streamer.queue_html(200, "<h1>CyberPanel Installed</h1>")
+    assert pull_leads.streamer_is_ready(streamer.url) is False
+    assert pull_leads.streamer_is_ready("http://127.0.0.1:9") is False
+
+
+def test_auto_end_to_end_with_real_http(tmp_path, streamer):
+    streamer.queue_json(200, {"status": "alive", "database": "ok"})
+    streamer.queue_json(200, _ok(_leads(3)), gz=True)
+    streamer.queue_json(200, {"status": "alive", "database": "ok"})
+    streamer.queue_json(200, {"status": "no_new_leads", "message": "No new Leads available", "leads": []})
+    processed = []
+    p = Puller(source_url=streamer.url, token=TOKEN, timeout=120, store=BatchStore(tmp_path / "pulled"),
+               process=lambda leads: processed.append(len(leads)) or Counter())
+    assert p.run_auto(60, sleep_fn=StopLoop(1)) == 130
+    assert processed == [3]
+    assert [r["path"] for r in streamer.requests] == ["/health", "/leads/next", "/health", "/leads/next"]
+
+
 # ------------------------------------------------------------------ deployment helpers
 
 def test_stop_signals_become_ctrl_c():
@@ -345,3 +489,88 @@ def test_after_hangup_output_is_silenced_so_cleanup_can_finish(monkeypatch):
     pull_leads._silence_output()
     pull_leads.say("campaign paused")                # now harmless
     print("summary line")
+
+
+def test_ping_passes_limit_query_param_when_provided(streamer):
+    streamer.queue_json(200, _ok(_leads(25)))
+    r = ping(streamer.url, TOKEN, 120, limit=25)
+    assert r.kind == BATCH and len(r.leads) == 25
+    assert streamer.requests[0]["path"] == "/leads/next?limit=25"
+
+    streamer.queue_json(200, _ok(_leads(5)))
+    r2 = ping(streamer.url, TOKEN, 120)
+    assert r2.kind == BATCH and len(r2.leads) == 5
+    assert streamer.requests[1]["path"] == "/leads/next"
+
+
+def test_default_process_forwards_batch_size_and_stop_event(monkeypatch):
+    import pipeline
+    captured = {}
+
+    def fake_run_leads_sync(leads, **kwargs):
+        captured["leads"] = leads
+        captured["kwargs"] = kwargs
+        return Counter(received=len(leads))
+
+    monkeypatch.setattr(pipeline, "run_leads_sync", fake_run_leads_sync)
+    evt = threading.Event()
+    pull_leads.default_process([{"company": "X"}], threshold=0.85, output=None, batch_size=75, stop_event=evt)
+    assert captured["kwargs"]["batch_size"] == 75
+    assert captured["kwargs"]["stop_event"] is evt
+
+
+def test_ping_and_check_setup_do_not_follow_redirects(streamer, monkeypatch, capsys):
+    # A misconfigured proxy returning 302 must not forward Authorization to the redirect target
+    redirect_headers = {"Location": f"{streamer.url}/other"}
+    streamer.queue_json(302, {"status": "redirect"}, headers=redirect_headers)
+    r = ping(streamer.url, TOKEN, 120)
+    assert r.kind == RETRY and "HTTP 302" in r.message
+    assert len(streamer.requests) == 1
+
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", TOKEN)
+    streamer.queue_json(200, {"status": "alive", "database": "ok"})
+    streamer.queue_json(302, {"status": "redirect"}, headers=redirect_headers)
+    rc = pull_leads.check_setup(streamer.url)
+    assert rc == 1
+    assert "HTTP 302" in capsys.readouterr().out
+    assert len(streamer.requests) == 3
+
+
+def test_preflight_validates_threshold_and_thinking_level(monkeypatch):
+    import decision_maker
+    monkeypatch.setattr(config, "LEAD_SOURCE_TOKEN", TOKEN)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(decision_maker, "check_gemini_access",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not call Gemini")))
+
+    monkeypatch.setattr(config, "INTEREST_THRESHOLD", 80.0)
+    err_t = pull_leads.preflight()
+    assert err_t is not None and "INTEREST_THRESHOLD" in err_t
+
+    monkeypatch.setattr(config, "INTEREST_THRESHOLD", 0.80)
+    monkeypatch.setattr(config, "GEMINI_THINKING_LEVEL", "MINIMAL")
+    err_l = pull_leads.preflight()
+    assert err_l is not None and "GEMINI_THINKING_LEVEL" in err_l
+
+
+def test_pull_leads_main_fails_before_ping_when_tracker_is_locked(tmp_path, monkeypatch, capsys):
+    from pipeline_tracker import PipelineTracker
+
+    tracker_path = tmp_path / "pipeline_tracker.xlsx"
+    monkeypatch.setattr(config, "PIPELINE_TRACKER_FILE", tracker_path)
+    monkeypatch.setattr(pull_leads, "preflight", lambda: None)
+    monkeypatch.setattr(
+        pull_leads.Puller,
+        "run",
+        lambda self: (_ for _ in ()).throw(AssertionError("Puller.run must not start while tracker is locked")),
+    )
+
+    held = PipelineTracker(tracker_path)
+    held.open()
+    try:
+        rc = pull_leads.main([])
+        assert rc == 1
+        assert "locked" in capsys.readouterr().out.lower()
+    finally:
+        held.close()

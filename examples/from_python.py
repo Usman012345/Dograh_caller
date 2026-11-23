@@ -35,7 +35,7 @@ def batch_example() -> None:
 async def stream_example() -> None:
     async with LeadPipeline() as pipeline:
         for lead in LEADS:              # replace with: async for lead in scraper()
-            await pipeline.submit(lead)  # verifier -> Jev -> Dograh call -> results.xlsx
+            await pipeline.submit(lead)  # verifier -> Gemini -> Dograh call -> results.xlsx
 
 
 if __name__ == "__main__":

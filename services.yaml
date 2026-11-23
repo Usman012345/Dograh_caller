@@ -1,7 +1,7 @@
 # ==============================================================================
 # SERVICES WE SELL
 # ==============================================================================
-# Jev reads these descriptions to decide which service (if any) a lead is
+# Gemini reads these descriptions to decide which service (if any) a lead is
 # likely to be interested in. Each lead whose probability for a service is
 # >= INTEREST_THRESHOLD is put into that service's campaign and called by its
 # Dograh agent. If several services pass, the highest probability wins.

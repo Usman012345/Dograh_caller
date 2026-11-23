@@ -167,6 +167,7 @@ def test_main_without_input_stops_before_contacting_anything(monkeypatch, capsys
     # Every run is live, so with no input configured main() must stop at once.
     monkeypatch.setattr(caller_main, "INPUT_FILE_PATH", None)
     monkeypatch.setattr(caller_main, "INPUT_LEADS", [])
+    monkeypatch.setattr(caller_main, "USE_STREAMER", False)
     monkeypatch.setattr(sys, "argv", ["main.py"])
 
     def must_not_run(*args, **kwargs):
@@ -179,3 +180,173 @@ def test_main_without_input_stops_before_contacting_anything(monkeypatch, capsys
 
 def test_main_default_input_is_not_the_fictional_sample():
     assert caller_main.INPUT_FILE_PATH is None
+    assert "sample_leads" not in str(caller_main.INPUT_FILE_PATH or "")
+
+
+class _AutoSetup:
+    """Replaces everything external for `python main.py`; records what ran, in order."""
+
+    def __init__(self, monkeypatch, tmp_path, *, use_streamer=True):
+        import json
+
+        import pull_leads
+
+        self.events = []
+        leads_file = tmp_path / "configured.json"
+        leads_file.write_text(json.dumps([{"company": "Fictional Co", "phone": "(512) 555-0101"}]), encoding="utf-8")
+        monkeypatch.setattr(caller_main, "INPUT_FILE_PATH", str(leads_file))
+        monkeypatch.setattr(caller_main, "INPUT_LEADS", [])
+        monkeypatch.setattr(caller_main, "LIMIT", None)
+        monkeypatch.setattr(caller_main, "USE_STREAMER", use_streamer)
+        monkeypatch.setattr(caller_main, "STREAMER_CHECK_SECONDS", 17)
+        monkeypatch.setattr(pull_leads, "stop_signals_act_like_ctrl_c", lambda: [])
+
+        def preflight(need_streamer=True):
+            self.events.append(("preflight", need_streamer))
+
+        def run_leads(leads, **kwargs):
+            self.events.append(("file", len(leads), kwargs["source_label"], kwargs["score_only"]))
+
+        def run_auto(puller, seconds, **kwargs):
+            self.events.append(("streamer", seconds))
+            return 130
+
+        monkeypatch.setattr(pull_leads, "preflight", preflight)
+        monkeypatch.setattr(caller_main, "run_leads_sync", run_leads)
+        monkeypatch.setattr(pull_leads.Puller, "run_auto", run_auto)
+
+
+def test_plain_run_calls_the_configured_file_then_starts_the_streamer(monkeypatch, tmp_path):
+    setup = _AutoSetup(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert caller_main.main() == 130
+    assert setup.events == [("preflight", True), ("file", 1, "file:configured.json", False), ("streamer", 17)]
+
+
+def test_streamer_can_be_turned_off_in_code(monkeypatch, tmp_path):
+    setup = _AutoSetup(monkeypatch, tmp_path, use_streamer=False)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert caller_main.main() == 0
+    assert setup.events == [("preflight", False), ("file", 1, "file:configured.json", False)]
+
+
+def test_streamer_only_when_no_file_is_set(monkeypatch, tmp_path):
+    setup = _AutoSetup(monkeypatch, tmp_path)
+    monkeypatch.setattr(caller_main, "INPUT_FILE_PATH", None)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert caller_main.main() == 130
+    assert setup.events == [("preflight", True), ("streamer", 17)]
+
+
+def test_wrong_file_path_stops_before_contacting_anything(monkeypatch, tmp_path, capsys):
+    setup = _AutoSetup(monkeypatch, tmp_path)
+    monkeypatch.setattr(caller_main, "INPUT_FILE_PATH", str(tmp_path / "missing.xlsx"))
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert caller_main.main() == 1
+    assert setup.events == []
+    assert "INPUT_FILE_PATH" in capsys.readouterr().out
+
+
+def test_score_only_and_one_off_files_never_use_the_streamer(monkeypatch, tmp_path):
+    setup = _AutoSetup(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--score-only", "--output", str(tmp_path / "s.xlsx")])
+    assert caller_main.main() == 0
+    assert setup.events == [("file", 1, "file:configured.json", True)]
+    setup.events.clear()
+    monkeypatch.setattr(sys, "argv", ["main.py", caller_main.INPUT_FILE_PATH])
+    assert caller_main.main() == 0
+    assert setup.events == [("file", 1, "file:configured.json", False)]
+
+
+def test_lead_streamer_limit_query_validation_and_clamping():
+    import threading
+    from types import SimpleNamespace
+    import requests as req
+
+    ls = _load_lead_streamer()
+    recorded_limits = []
+
+    class FakeStore:
+        batch_lock = threading.Lock()
+
+        def check_health(self):
+            return "ok"
+
+        def fetch_next_batch(self, limit=None):
+            recorded_limits.append(limit)
+            return {"status": "no_new_leads", "message": "No new Leads available", "count": 0, "leads": []}
+
+    token = "test-stream-token-123456"
+    cfg = SimpleNamespace(
+        expected_host="",
+        max_concurrent_requests=4,
+        request_timeout_seconds=5.0,
+        stream_token_bytes=token.encode("utf-8"),
+        batch_size=300,
+    )
+    logger = ls.StructuredLogger(50, (token,))
+    server = ls.LeadStreamerServer(("127.0.0.1", 0), ls.LeadStreamerHandler, cfg, logger, FakeStore())
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r_default = req.get(f"{base}/leads/next", headers=headers, timeout=5)
+        assert r_default.status_code == 200
+        assert recorded_limits[-1] is None
+
+        r_50 = req.get(f"{base}/leads/next?limit=50", headers=headers, timeout=5)
+        assert r_50.status_code == 200
+        assert recorded_limits[-1] == 50
+
+        r_over = req.get(f"{base}/leads/next?limit=5000", headers=headers, timeout=5)
+        assert r_over.status_code == 200
+        assert recorded_limits[-1] == 1000
+
+        for bad in ("0", "-3", "abc", ""):
+            r_bad = req.get(f"{base}/leads/next?limit={bad}", headers=headers, timeout=5)
+            assert r_bad.status_code == 400
+            assert r_bad.json()["error"] == "bad_request"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_pg_store_fetch_next_batch_clamps_limit():
+    import threading
+    from types import SimpleNamespace
+
+    ls = _load_lead_streamer()
+    seen_params = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            seen_params.append(params)
+
+        def fetchall(self):
+            return []
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def rollback(self):
+            pass
+
+    store = ls.PgStore.__new__(ls.PgStore)
+    store._config = SimpleNamespace(batch_size=300)
+    store._conn_lock = threading.Lock()
+    store._begin_batch_tx_locked = lambda: FakeConn()
+
+    store.fetch_next_batch()
+    store.fetch_next_batch(limit=45)
+    store.fetch_next_batch(limit=0)
+    store.fetch_next_batch(limit=2500)
+    assert [p["batch_size"] for p in seen_params] == [300, 45, 1, 1000]

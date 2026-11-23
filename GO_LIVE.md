@@ -135,6 +135,7 @@ touch `dograh.grobots.ai` or other sites; use `lswsctrl reload`, never `systemct
 | `answered HTTP 200 {'status': 'ok'} - that is not the lead streamer` | the name still reaches the mail server's old receiver | DNS not moved yet / cached; wait for the TTL, check `nslookup` |
 | `… {'status': 'healthy', 'service': 'DataOps AI Backend' …}` | nginx answered with the scraper's site | step 2: site not enabled or wrong `server_name` |
 | `TLS/certificate problem` (certificate for `scrapper.grobots.ai`) | certbot hasn't run for `ai-sdr` | step 5 |
+| Intermittent `TLS/certificate problem` or `404` (~70% fail, ~30% succeed) | stale nginx workers or duplicate nginx process still serving the old config after `reload` | inspect `ps aux \| grep nginx` and `sudo ss -tulpn \| grep -E ':80\|:443'`, then `sudo nginx -t && sudo systemctl restart nginx` |
 | `HTTP 421` | nginx doesn't pass the name on | keep `proxy_set_header Host $host;` in the site |
 | `HTTP 404` | request didn't reach the streamer | step 2 |
 | nginx `502 Bad Gateway` | streamer not running | `systemctl status lead-streamer`, `journalctl -u lead-streamer -n 30` |

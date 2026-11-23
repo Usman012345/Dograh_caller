@@ -8,7 +8,7 @@ split into words ("faxNumber" -> ["fax", "number"]) and classified by those
 words, and nested values are walked recursively.
 
 Used by the number verifier (finding phone and fax numbers) and the decision
-maker (building the clean, descriptive input Jev sees).
+maker (building the clean, descriptive input Gemini sees).
 """
 
 from __future__ import annotations

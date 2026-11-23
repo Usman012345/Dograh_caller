@@ -57,20 +57,22 @@ ALLOWED_PHONE_REGIONS = [r for r in _env("ALLOWED_PHONE_REGIONS", "US").split(",
 SKIP_ALREADY_CALLED: bool = _env("SKIP_ALREADY_CALLED", "true").lower() not in ("0", "false", "no")
 
 # ------------------------------------------------------------------------------
-# Jev (TypeSafe) - decision maker
+# Gemini - decision maker
 # ------------------------------------------------------------------------------
-JEV_API_KEY: str = _env("TYPESAFE_API_KEY", "", "Jev_Key", "JEV_KEY", "JEV_API_KEY")
-# Pin an exact version in production; "jev-latest" moves when TypeSafe ships.
-JEV_MODEL: str = _env("JEV_MODEL", "jev-1.14.0")
+GEMINI_API_KEY: str = _env("GEMINI_API_KEY", "", "GEMINI_API")
+GEMINI_MODEL: str = _env("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_THINKING_LEVEL: str = _env("GEMINI_THINKING_LEVEL", "MEDIUM").upper()  # LOW, MEDIUM or HIGH
+GEMINI_TIMEOUT_SECONDS: int = _env_int("GEMINI_TIMEOUT_SECONDS", 60)
+GEMINI_MAX_ATTEMPTS: int = _env_int("GEMINI_MAX_ATTEMPTS", 4)
 
-# A lead is passed to a service's calling agent only if Jev's probability that
-# the lead is interested in that service is >= this value (0.85 = 85%).
-INTEREST_THRESHOLD: float = _env_float("INTEREST_THRESHOLD", 0.85)
+# A lead is passed to a service's calling agent only if the probability that
+# the lead is a fit for that service is >= this value (0.80 = 80%).
+INTEREST_THRESHOLD: float = _env_float("INTEREST_THRESHOLD", 0.80)
 
-# What Jev gets per lead: only descriptive fields (see decision_maker.lead_state),
-# each cut to JEV_MAX_FIELD_CHARS, all together at most JEV_MAX_STATE_CHARS.
-JEV_MAX_FIELD_CHARS: int = _env_int("JEV_MAX_FIELD_CHARS", 2000)
-JEV_MAX_STATE_CHARS: int = _env_int("JEV_MAX_STATE_CHARS", 12000)
+# What Gemini gets per lead: only descriptive fields (see decision_maker.lead_state),
+# each cut to LEAD_MAX_FIELD_CHARS, all together at most LEAD_MAX_STATE_CHARS.
+LEAD_MAX_FIELD_CHARS: int = _env_int("LEAD_MAX_FIELD_CHARS", _env_int("JEV_MAX_FIELD_CHARS", 2000))
+LEAD_MAX_STATE_CHARS: int = _env_int("LEAD_MAX_STATE_CHARS", _env_int("JEV_MAX_STATE_CHARS", 12000))
 
 # Where services (DraftLiner, Paradise, ...) are described. See SERVICES.md.
 SERVICES_FILE: Path = Path(_env("SERVICES_FILE", str(PROJECT_DIR / "services.yaml")))
@@ -115,7 +117,7 @@ LEAD_BATCH_SIZE: int = _env_int("LEAD_BATCH_SIZE", 300)
 
 # Max items waiting between two stages (back-pressure: faster stages pause).
 QUEUE_MAXSIZE: int = _env_int("QUEUE_MAXSIZE", 100)
-# Parallel Jev requests.
+# Parallel Gemini requests.
 DECISION_CONCURRENCY: int = _env_int("DECISION_CONCURRENCY", 8)
 
 # Most lead fields that get their own column in the results sheet. Leads are
@@ -125,6 +127,18 @@ RESULTS_MAX_LEAD_COLUMNS: int = _env_int("RESULTS_MAX_LEAD_COLUMNS", 80)
 
 # Results spreadsheet (created if missing, appended to if it exists).
 RESULTS_FILE: Path = Path(_env("RESULTS_FILE", str(PROJECT_DIR / "output" / "call_results.xlsx")))
+
+# Per-lead Excel pipeline tracker (one row per lead, updated at each stage).
+PIPELINE_TRACKER_FILE: Path = Path(_env("PIPELINE_TRACKER_FILE", str(PROJECT_DIR / "output" / "pipeline_tracker.xlsx")))
+TRACKER_SAVE_SECONDS: int = _env_int("TRACKER_SAVE_SECONDS", 3)
+TRACKER_WARN_ROWS: int = _env_int("TRACKER_WARN_ROWS", 20000)
+
+# ------------------------------------------------------------------------------
+# Dashboard (read-only)
+# ------------------------------------------------------------------------------
+DASHBOARD_HOST: str = _env("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT: int = _env_int("DASHBOARD_PORT", 8090)
+DASHBOARD_REFRESH_SECONDS: int = _env_int("DASHBOARD_REFRESH_SECONDS", 5)
 
 # Separate spreadsheet with only the businesses whose call the agent transferred
 # (to a person / another number), with their details - for whoever takes them over.

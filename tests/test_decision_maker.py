@@ -76,8 +76,8 @@ def test_refined_noise_words_keep_descriptive_compounds_and_drop_bookkeeping():
 
 
 def test_lead_state_caps_merged_list_fields_and_respects_state_budget(monkeypatch):
-    monkeypatch.setattr(config, "JEV_MAX_FIELD_CHARS", 50)
-    monkeypatch.setattr(config, "JEV_MAX_STATE_CHARS", 400)
+    monkeypatch.setattr(config, "LEAD_MAX_FIELD_CHARS", 50)
+    monkeypatch.setattr(config, "LEAD_MAX_STATE_CHARS", 400)
 
     lead = {
         "company": "Bridgeworks Engineering",
@@ -94,20 +94,22 @@ def test_lead_state_caps_merged_list_fields_and_respects_state_budget(monkeypatc
 
 
 def test_decide_short_circuits_empty_state(monkeypatch):
+    called = False
+
+    class FakeModels:
+        async def generate_content(self, **kwargs):
+            nonlocal called
+            called = True
+            return SimpleNamespace(text="{}")
+
     class FakeClient:
-        called = False
-
         def __init__(self, *args, **kwargs):
+            self.aio = SimpleNamespace(models=FakeModels(), aclose=self._aclose)
+
+        async def _aclose(self):
             pass
 
-        async def system_one(self, **kwargs):
-            FakeClient.called = True
-            return SimpleNamespace(nouls={})
-
-        async def aclose(self):
-            pass
-
-    monkeypatch.setattr("decision_maker.AsyncTypeSafeClient", FakeClient)
+    monkeypatch.setattr("decision_maker.genai.Client", FakeClient)
     svc = Service(
         id="draftliner",
         name="Draftliner",
@@ -116,7 +118,7 @@ def test_decide_short_circuits_empty_state(monkeypatch):
         good_fit="Architects",
         not_a_fit="Restaurants",
     )
-    dm = DecisionMaker([svc], 0.85, "fake-key", "jev-1.14.0")
+    dm = DecisionMaker([svc], 0.80, "fake-key", "gemini-3.8-flash")
 
     async def run():
         try:
@@ -124,7 +126,9 @@ def test_decide_short_circuits_empty_state(monkeypatch):
             d = await dm.decide({"phone": "512-555-0101", "email": "a@example.com", "id": 123})
             assert d.qualified is False
             assert d.probabilities == {}
-            assert FakeClient.called is False
+            assert "no business details" in d.summary.lower()
+            assert "Non-Qualified" in d.verdict
+            assert called is False
         finally:
             await dm.close()
 

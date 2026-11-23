@@ -2,7 +2,7 @@
 # Set up the dograh caller on a Linux server (or macOS), in this folder.
 #
 #   1. Copy the dograh_caller folder to the server, with its .env
-#      (Jev_Key, DOGRAH_API_KEY, DOGRAH_BASE_URL, LEAD_SOURCE_TOKEN).
+#      (GEMINI_API_KEY, DOGRAH_API_KEY, DOGRAH_BASE_URL, LEAD_SOURCE_TOKEN).
 #   2. bash install.sh
 #   3. Start it inside tmux, so it survives a dropped SSH connection:
 #        tmux new -s caller
@@ -26,10 +26,9 @@ say "Settings (.env)"
 [ -f .env ] || fail ".env is missing - copy .env.example to .env and fill it in"
 chmod 600 .env
 missing=""
-for key in DOGRAH_API_KEY LEAD_SOURCE_TOKEN; do
-  grep -qE "^${key}=.+" .env || missing="$missing $key"
-done
-grep -qE '^(Jev_Key|TYPESAFE_API_KEY|JEV_KEY|JEV_API_KEY)=.+' .env || missing="$missing Jev_Key"
+grep -qE '^DOGRAH_API_KEY=.+' .env || missing="$missing DOGRAH_API_KEY"
+grep -qE '^(LEAD_SOURCE_TOKEN|STREAM_TOKEN)=.+' .env || missing="$missing LEAD_SOURCE_TOKEN"
+grep -qE '^(GEMINI_API_KEY|GEMINI_API)=.+' .env || missing="$missing GEMINI_API_KEY"
 [ -z "$missing" ] || fail "empty or missing in .env:$missing"
 echo ".env has the keys it needs (permissions set to 600)"
 

@@ -105,7 +105,7 @@ class DograhClient:
         try:
             return resp.json()
         except ValueError:
-            raise DograhError(f"{action}: Dograh returned a non-JSON response.")
+            raise DograhError(f"{action}: Dograh returned a non-JSON response.") from None
 
     # -- agents ----------------------------------------------------------------
 
@@ -166,7 +166,7 @@ class DograhClient:
             put = requests.put(upload_url, data=data, headers={"Content-Type": "text/csv"},
                                timeout=60, verify=config.VERIFY_SSL)
         except requests.RequestException as e:
-            raise DograhError(f"Uploading contacts to storage ({urlparse(upload_url).hostname}) failed: {e}")
+            raise DograhError(f"Uploading contacts to storage ({urlparse(upload_url).hostname}) failed: {e}") from e
         if put.status_code not in (200, 204):
             raise DograhError(f"Uploading contacts failed (HTTP {put.status_code}): {(put.text or '')[:300]}")
         return file_key

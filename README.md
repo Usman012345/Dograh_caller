@@ -8,15 +8,16 @@ Give it a list of businesses. It finds the ones likely to buy **Draftliner** or
 1. **Reads your list** of businesses (a spreadsheet, or dicts sent by the scraper).
 2. **Checks each phone number.** It keeps only real US numbers, and skips
    duplicates and businesses that were already called.
-3. **Asks Jev (an AI model)** whether the business would buy Draftliner,
-   Paradise Estimating, or neither.
-4. **Calls the interested businesses.** For each service it creates a Dograh
+3. **Asks Gemini (`gemini-3.8-flash`)** to score each enabled service (0–100%)
+   and write a short explanation.
+4. **Calls the qualified businesses (≥ 80%).** For each service it creates a Dograh
    campaign, e.g. `Draftliner_2026-11-19`, and that service's agent makes the calls.
 5. **Saves everything** to `output/call_results.xlsx`, one row per business:
-   who was called, which service, and how the call went.
+   who was called, which service, and how the call went, plus per-lead
+   tracking in `output/pipeline_tracker.xlsx` for the dashboard.
 
 ```
-your list ─► check numbers ─► Jev: which service? ─► Dograh campaign + agent calls ─► results spreadsheet
+your list ─► check numbers ─► Gemini: score services ─► Dograh campaign + agent calls ─► results & tracker
 ```
 
 | Service | Dograh agent that calls |
@@ -37,7 +38,7 @@ pip install -r requirements.txt
 **b. Add your keys.** Copy `.env.example` to `.env` and fill in:
 
 ```ini
-Jev_Key=your-jev-key
+GEMINI_API_KEY=your-gemini-key
 DOGRAH_API_KEY=your-dograh-key
 DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 ```
@@ -54,7 +55,7 @@ version, so publish after every change you make to an agent.
 python pull_leads.py --check
 ```
 
-It confirms the Jev key, `services.yaml`, each Dograh agent, that the lead
+It confirms the Gemini key, `services.yaml`, each Dograh agent, that the lead
 streamer answers at `LEAD_SOURCE_URL`, and that it accepts the token.
 
 ### Running it on a server (Linux)
@@ -64,16 +65,16 @@ Copy this folder to the server **with its `.env`**, then:
 ```bash
 bash install.sh               # .venv + requirements + the --check above; no root needed
 tmux new -s caller            # keeps it running if your SSH connection drops
-.venv/bin/python pull_leads.py
+.venv/bin/python main.py      # runs INPUT_FILE_PATH, then pulls from the streamer automatically
 ```
 
 Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. If the
 process is killed or the SSH session ends anyway, it stops the same way as
 Ctrl+C: this run's Dograh campaigns are paused and the unfinished batch is
-kept and offered again on the next start.
+kept and continues on the next start.
 
 On Windows: `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`,
-then `.venv\Scripts\python pull_leads.py`. (`bash install.sh` also works in Git Bash.)
+then `.venv\Scripts\python main.py`. (`bash install.sh` also works in Git Bash.)
 
 Tests: `pip install -r requirements-dev.txt`, then `python -m pytest`.
 
@@ -86,10 +87,10 @@ The first row holds the column names. You need:
 - **a phone column**, for example `Phone`, `Phone(s)`, `Phone Number` or `Mobile`
   (several numbers in one cell are fine; **fax numbers are never called**);
 - **columns describing the business**, for example company, industry,
-  description and city. The more Jev knows about a business, the better it decides.
+  description and city. The more Gemini knows about a business, the better it decides.
 
 Data from the scraper can be unstructured (any field names, nested data, lists,
-JSON text): phone numbers are found wherever they are, and Jev only gets the
+JSON text): phone numbers are found wherever they are, and Gemini only gets the
 fields that describe the business. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §6–7.
 
 | Company | Industry | Notes | City / State | Phone(s) |
@@ -99,17 +100,26 @@ fields that describe the business. Details: [DOCUMENTATION.md](DOCUMENTATION.md)
 **Step 2 — Point the program at your file.** Open [main.py](main.py) and edit the top:
 
 ```python
-INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"
-LIMIT = 5        # optional: only the first 5 businesses, good for a first test. None = all
+INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"   # None = no file, streamer only
+LIMIT = None                                     # or 5 for only the first 5 businesses
+USE_STREAMER = True                              # keep pulling from the streamer after the file
+STREAMER_CHECK_SECONDS = 60
 ```
 
 **Step 3 — Run it:**
 
 ```bash
-python main.py
+python main.py                  # live: calls the file's qualified leads, then serves the streamer
+python main.py leads.xlsx --score-only   # test scoring only; never calls Dograh
 ```
 
-> ⚠️ **Every run is live.** Businesses that pass the check really get called.
+After the file finishes, the program keeps running and checks the streamer every
+60 seconds. While the reverse proxy is not attached it only waits. Once the real
+streamer answers, it takes a batch, calls it completely, and takes the next one.
+Press **Ctrl+C** to stop.
+
+> ⚠️ **Normal runs are live.** Businesses that pass the 80% threshold really get called.
+> Pass `--score-only` to test verification and Gemini scoring safely without contacting Dograh or touching `output/call_results.xlsx`.
 
 Leads are processed **300 at a time** (`LEAD_BATCH_SIZE`): the program checks and scores a batch,
 calls everyone in it, then moves on to the next 300.
@@ -122,9 +132,10 @@ Example output (the real lines also start with the time):
 
 ```
 [setup]    Services: Draftliner (agent 2), Paradise Estimating (agent 3)
+[setup]    Gemini model gemini-3.8-flash (thinking MEDIUM), threshold 80%
 [verify]   DROP +1 416 555 0107 (dropped_not_us (CA)) - Maple Leaf Builders   ← number not usable
-[decide]   SKIP +16025550105 Taco Loco - not interested (draftliner 3%, paradise 5%)
-[decide]   PASS +18285550102 Blue Ridge Architects -> Draftliner (draftliner 94%, paradise 8%)
+[decide]   NON-QUALIFIED +16025550105 Taco Loco (draftliner 3%, paradise 5%)
+[decide]   QUALIFIED +18285550102 Blue Ridge Architects -> Draftliner (draftliner 94%, paradise 8%)
 [campaign] Started 'Draftliner_2026-11-19' (campaign 21) with 12 number(s)
 [call]     -> Calling +18285550102 (Blue Ridge Architects) [Draftliner_2026-11-19, run 2210]
 [call]     <- +18285550102 Result: user_qualified | 67s | tags: user_qualified
@@ -133,8 +144,8 @@ Done. Leads received: 10 | dropped by verifier: 1 | not interested: 2 | called: 
 ```
 
 - **DROP**: the phone number can't be used (not US, invalid, a duplicate, or already called).
-- **SKIP**: Jev thinks the business won't be interested in any service.
-- **PASS**: interested; the business is added to that service's campaign.
+- **NON-QUALIFIED**: Gemini scored every service below the 80% threshold.
+- **QUALIFIED**: scored ≥ 80%; the business is added to the highest-scoring service's campaign.
 - **Calling / Result**: a call starts, then its outcome from Dograh.
 - **finished - paused**: all calls in the campaign are done. Campaigns are
   never left running.
@@ -173,7 +184,8 @@ lead had. The file appears with the first transfer. In `call_results.xlsx` those
 |---|---|
 | `status` | What happened (see below) |
 | `interested_service` | Draftliner or Paradise Estimating |
-| `prob_draftliner`, `prob_paradise` | How likely Jev thinks each service is (0–1) |
+| `prob_draftliner`, `prob_paradise` | How likely Gemini thinks each service is (0–1) |
+| `decision_verdict`, `decision_summary` | Qualification verdict and two-line Gemini explanation |
 | `campaign_name` | The Dograh campaign it was called in |
 | `call_disposition` | How the call ended, e.g. `user_qualified`, `user_hangup`, `no-answer` |
 | `transcript_url`, `recording_url` | The conversation |
@@ -181,7 +193,9 @@ lead had. The file appears with the first transfer. In `call_results.xlsx` those
 | `status` | Meaning |
 |---|---|
 | `called` | The call happened; see `call_disposition` |
-| `not_interested` | Jev scored it below 85% for every service; not called |
+| `not_interested` | Gemini scored it below 80% for every service; not called |
+| `scored_qualified` | Scored ≥ 80% in a `--score-only` run; not called |
+| `decision_error` | Gemini request failed after retries; saved for retry |
 | `dropped_...` | Phone problem: `not_us`, `invalid_number`, `special_number` (e.g. 900), `fax_only` (only fax numbers — fax numbers are never called), `duplicate`, `already_called`, `no_phone` |
 | `call_failed` / `call_timeout` | Dograh couldn't place the call, or it never finished |
 | `skipped_missing_data` | The agent's script needs information this business didn't have |
@@ -206,20 +220,23 @@ LEAD_SOURCE_TOKEN=the-streamer's-STREAM_TOKEN
 Then run:
 
 ```bash
-python pull_leads.py
+python main.py
 ```
 
-1. It pings the streamer and receives one batch of up to **300** leads.
-2. It saves the batch to `output/pulled_batches/`, then processes **all** of it
-   (check numbers → Jev → campaigns → every call finished → results sheet).
-3. It **waits for you**: press **Enter** to ping for the next batch, or type
-   **q** to quit. It never pings again on its own. That's also true after
-   "No new Leads available" or an error.
+1. It confirms the real streamer answers `/health`. Until then it just waits.
+2. It pings the streamer and receives one batch of up to **300** leads.
+3. It saves the batch to `output/pulled_batches/`, then processes **all** of it
+   (check numbers → Gemini → campaigns → every call finished → results sheet).
+4. It immediately asks for the next batch. With no new leads, it checks again
+   every `STREAMER_CHECK_SECONDS`.
 
 If it is stopped mid-batch (Ctrl+C, crash, error), the batch stays in
-`output/pulled_batches/*.pending.json` and the next start asks whether to finish
-it first. That matters because the streamer marks leads as sent the moment it
-hands them out. Numbers that were already called are skipped.
+`output/pulled_batches/*.pending.json` and is finished first on the next start,
+before any new leads are taken. That matters because the streamer marks leads as
+sent the moment it hands them out. Numbers that were already called are skipped.
+
+To approve every batch by hand instead, run `python pull_leads.py`: it waits for
+**Enter** before each ping.
 
 ## 7. Sending leads from other code
 
@@ -236,12 +253,38 @@ See [examples/from_python.py](examples/from_python.py) for streaming leads one b
 
 ---
 
-## 8. Changing how it behaves
+## 8. Client Dashboard
+
+The web dashboard shows the live pipeline flow (`Incoming Leads → Number Verifier → Decision Maker → Qualified / Non-Qualified → Calling Agent → Call Results`, plus `Transferred Calls`) and lets you start or stop streamer batch runs from the top bar. Clients can see the conversion funnel and anything needing attention, open any stage, and read a lead's full story: AI reasoning, why it was or was not called, the recording and the conversation.
+
+```bash
+python dashboard_server.py
+```
+
+Then open <http://127.0.0.1:8090>.
+
+- **What it reads:** `output/pipeline_tracker.xlsx`. Leads appear once a run has processed them, and the server does not need Node at runtime (it serves the pre-built `dashboard/static/` bundle).
+- **Start / Stop Batch:** click **Start Batch** in the top bar to pull 1–100 batches of 1–1,000 leads from the streamer and run the pipeline in the background (or click **Stop** to pause campaigns and keep unfinished leads pending for resume). In `--demo` mode, **Start Batch** runs an offline simulation without touching the streamer or Dograh.
+- **Recordings and transcripts:** the server fetches them from Dograh with the key in `.env`. The key and the private file links never reach the browser.
+- **Security:** the dashboard has **no login**. By default it binds to `127.0.0.1:8090` (this computer only) and refuses requests for other host names. With a non-loopback `--host` it prints a warning, because anyone who can reach the address can see lead details, phone numbers, transcripts, recordings, and batch controls.
+
+**Client demo:** show the dashboard with ~60 fictional leads, conversations and sample audio. It uses no real data and contacts nothing:
+
+```bash
+python dashboard_server.py --demo
+```
+
+**Changing the interface:** edit `dashboard/web/src`, then run `npm install` and `npm run build` in `dashboard/web`. The built files in `dashboard/static` are what the server uses.
+
+---
+
+## 9. Changing how it behaves
 
 | I want to… | Do this |
 |---|---|
 | Add or change a service (who it targets, which agent calls) | Edit [services.yaml](services.yaml); no code. See [SERVICES.md](SERVICES.md) |
-| Call fewer, surer leads (or more) | Set `INTEREST_THRESHOLD=0.9` (stricter) or `0.8` in `.env` |
+| Test scoring without placing any calls | `python main.py path\to\leads.xlsx --score-only` |
+| Call fewer, surer leads (or more) | Set `INTEREST_THRESHOLD=0.9` (stricter) or `0.75` in `.env` |
 | Change the batch size | Set `LEAD_BATCH_SIZE=500` in `.env` (and `BATCH_SIZE` in the streamer's `.env` to match) |
 | Change retries for busy / no-answer calls | `CAMPAIGN_MAX_RETRIES`, `CAMPAIGN_RETRY_DELAY_SECONDS` in `.env` |
 | Run a different file once without editing main.py | `python main.py other.xlsx --limit 5` |
@@ -250,11 +293,11 @@ All settings: [DOCUMENTATION.md](DOCUMENTATION.md), section 4.
 
 ---
 
-## 9. Common problems
+## 10. Common problems
 
 | Problem | Fix |
 |---|---|
-| `Jev API key not found` / `Dograh API key not found` | Add the key to `.env` (step 1b) |
+| `Gemini API key not found` / `Dograh API key not found` | Add the key to `.env` (`GEMINI_API_KEY=...` or `GEMINI_API=...`) |
 | `Dograh rejected the API key (HTTP 401)` | The key comes from a different Dograh, or was archived. Create one under Settings → API Keys |
 | Every row says `dropped_no_phone` | No column name looks like a phone column. Rename it to `Phone` |
 | Almost everyone is `not_interested` | Your list lacks business details, or the services don't fit. Add industry/description columns, or check [services.yaml](services.yaml) |

@@ -14,7 +14,6 @@ import os
 import pathlib
 import re
 import signal
-import socket
 import sys
 import threading
 import time
@@ -1363,7 +1362,7 @@ class PgStore:
         except Exception as exc:
             self._close_locked()
             self._logger.error(
-                "db_unavailable",
+                "schema_mismatch" if isinstance(exc, SchemaMismatchError) else "db_unavailable",
                 error=self._logger.sanitize_error(exc),
                 action="reconnect_next_request",
             )
@@ -1406,7 +1405,12 @@ class PgStore:
                 raise _unavailable(exc) from exc
         raise DbUnavailableError()
 
-    def fetch_next_batch(self) -> dict[str, typing.Any]:
+    def fetch_next_batch(self, limit: int | None = None) -> dict[str, typing.Any]:
+        effective_limit = (
+            self._config.batch_size
+            if limit is None
+            else max(1, min(1000, int(limit)))
+        )
         with self._conn_lock:
             conn = self._begin_batch_tx_locked()
             try:
@@ -1421,7 +1425,7 @@ class PgStore:
                         ORDER BY l.created_at ASC, l.id ASC
                         LIMIT %(batch_size)s;
                         """,
-                        {"batch_size": self._config.batch_size},
+                        {"batch_size": effective_limit},
                     )
                     due_ids = [str(row[0]) for row in cur.fetchall()]
 
@@ -1762,7 +1766,7 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
         else:
             body_obj = {"status": "error", "error": "internal_error"}
         try:
-            self._send_json(code, body_obj)
+            self._send_json(code, body_obj, send_body=(getattr(self, "command", None) != "HEAD"))
         except OSError:
             pass
 
@@ -1821,14 +1825,16 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
         status_code: int,
         payload: dict[str, typing.Any],
         extra_headers: dict[str, str] | None = None,
-        send_body: bool = True,
+        send_body: bool | None = None,
     ) -> int:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self._send_bytes(status_code, body, extra_headers=extra_headers, send_body=send_body)
+        allow_body = getattr(self, "_send_body_allowed", True) if send_body is None else send_body
+        self._send_bytes(status_code, body, extra_headers=extra_headers, send_body=allow_body)
         return len(body)
 
     def _dispatch(self, method: str) -> None:
         self.close_connection = True
+        self._send_body_allowed = method != "HEAD"
         if not self.server.request_semaphore.acquire(blocking=False):
             client = self._client_ip()
             self.server.logger.warn("busy", client=client)
@@ -1841,7 +1847,8 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
 
         self.server.enter_request()
         try:
-            path = urllib.parse.urlsplit(self.path).path
+            parsed_url = urllib.parse.urlsplit(self.path)
+            path = parsed_url.path
             client = self._client_ip()
 
             if path == "/health":
@@ -1886,9 +1893,22 @@ class LeadStreamerHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if path == "/leads/next":
+                params = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+                raw_vals = params.get("limit") if "limit" in params else params.get("batch_size")
+                requested_limit: int | None = None
+                if raw_vals is not None:
+                    raw_limit = raw_vals[-1].strip()
+                    if not re.fullmatch(r"[+-]?\d+", raw_limit):
+                        self._send_json(400, {"status": "error", "error": "bad_request"})
+                        return
+                    parsed_limit = int(raw_limit)
+                    if parsed_limit < 1:
+                        self._send_json(400, {"status": "error", "error": "bad_request"})
+                        return
+                    requested_limit = min(1000, parsed_limit)
                 with self.server.store.batch_lock:
                     t0 = time.monotonic()
-                    batch = self.server.store.fetch_next_batch()
+                    batch = self.server.store.fetch_next_batch(limit=requested_limit)
                     body = json.dumps(batch, ensure_ascii=False, separators=(",", ":")).encode(
                         "utf-8"
                     )

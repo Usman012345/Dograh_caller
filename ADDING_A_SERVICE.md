@@ -1,12 +1,12 @@
 # How to add a new service
 
 A **service** is something we sell (today: Draftliner and Paradise Estimating).
-For every lead, Jev scores how likely it is to buy each service, and leads that
+For every lead, Gemini scores how likely it is to buy each service, and leads that
 score high enough are called by that service's Dograh agent.
 
 Adding a service is **configuration only**: you edit [`services.yaml`](services.yaml)
 and set up an agent in Dograh. No Python changes are needed. The pipeline picks
-up the new service, asks Jev about it, creates its campaigns, and adds its
+up the new service, asks Gemini about it, creates its campaigns, and adds its
 `prob_<id>` column to the results sheet automatically.
 
 The example below adds a made-up service called **Acme Permits**.
@@ -67,7 +67,7 @@ Field rules (they are checked at startup, and the run stops with a clear error i
 
 ## Step 3: Write the three descriptions well
 
-Jev decides **only** from this text, so this step matters most.
+Gemini decides **only** from this text, so this step matters most.
 
 - **Describe the buyer, not just the product.** In `good_fit`, name the business
   types, trades and sizes that buy, plus signals from a listing ("bids on projects", "uses Revit").
@@ -99,8 +99,7 @@ python -c "from dograh_client import DograhClient; c=DograhClient(); a=c.get_age
 Replace `4` with your agent ID. Every variable printed must be a column in your
 leads, or those leads will be skipped.
 
-**b. Score some sample leads with Jev.** This uses Jev but places no calls.
-Save the following as a scratch file in the `dograh_caller` folder (e.g. `try_scores.py`)
+**b. Score some sample leads with Gemini.** You can either run `python main.py your_fictional_leads.json --score-only` or save the following as a scratch file in the `dograh_caller` folder (e.g. `try_scores.py`)
 and run `python try_scores.py`:
 
 ```python
@@ -116,7 +115,7 @@ LEADS = [
 
 async def main():
     dm = DecisionMaker(load_services(config.SERVICES_FILE), config.INTEREST_THRESHOLD,
-                       config.JEV_API_KEY, config.JEV_MODEL)
+                       config.GEMINI_API_KEY, config.GEMINI_MODEL)
     for lead in LEADS:
         d = await dm.decide(lead)
         scores = ", ".join(f"{k} {v:.0%}" for k, v in d.probabilities.items())
@@ -126,7 +125,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Good leads should score **≥ 85%** for the new service, and bad ones well below.
+Good leads should score **≥ 80%** for the new service, and bad ones well below.
 Leads that belong to an existing service should still go to that service. If the
 scores are wrong, edit the descriptions (Step 3) and run again. Delete the scratch file when you're done.
 
