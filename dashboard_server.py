@@ -45,9 +45,7 @@ def allowed_hosts_for(bind_host: str) -> Optional[List[str]]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Start the dograh_caller dashboard server (stays idle until you start a batch run)."
-    )
+    parser = argparse.ArgumentParser(description="Start the read-only dograh_caller dashboard server.")
     parser.add_argument("--host", default=config.DASHBOARD_HOST, help=f"Bind host (default {config.DASHBOARD_HOST})")
     parser.add_argument("--port", type=int, default=config.DASHBOARD_PORT, help=f"Bind port (default {config.DASHBOARD_PORT})")
     parser.add_argument(
@@ -74,7 +72,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     warn_if_non_loopback(args.host)
     print(f"Dashboard reading {'FICTIONAL DEMO DATA from ' if args.demo else 'tracker: '}{tracker}", flush=True)
     print(f"Dashboard listening on http://{args.host}:{args.port}", flush=True)
-    print("Batch runner is idle. Open the dashboard and click 'Start Batch' to pull and call leads.", flush=True)
 
     app = create_app(tracker_path=tracker, media=media, demo=args.demo,
                      allowed_hosts=allowed_hosts_for(args.host))
