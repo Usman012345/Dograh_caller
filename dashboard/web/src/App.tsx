@@ -288,6 +288,8 @@ export const App: React.FC = () => {
         <BatchRunnerModal
           defaultBatchSize={runner?.batch_size || 300}
           defaultNumBatches={runner?.total_batches || 1}
+          sourceUrl={runner?.source_url ?? null}
+          demo={Boolean(summary?.demo)}
           onClose={() => setBatchModalOpen(false)}
           onStarted={handleRunnerStarted}
         />

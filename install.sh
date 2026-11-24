@@ -4,9 +4,10 @@
 #   1. Copy the dograh_caller folder to the server, with its .env
 #      (GEMINI_API_KEY, DOGRAH_API_KEY, DOGRAH_BASE_URL, LEAD_SOURCE_TOKEN).
 #   2. bash install.sh
-#   3. Start it inside tmux, so it survives a dropped SSH connection:
+#   3. Start the dashboard inside tmux, so it survives a dropped SSH connection
+#      (stays idle on startup until you click Start Batch; pulls from reverse proxy):
 #        tmux new -s caller
-#        .venv/bin/python pull_leads.py
+#        .venv/bin/python dashboard_server.py
 #
 # Safe to run again (e.g. after updating the code). No root needed.
 # It installs nothing system-wide and takes no leads from the streamer.
@@ -43,9 +44,9 @@ say "Checking keys, Dograh agents and the lead streamer (no leads are taken)"
 if "$BIN/python" pull_leads.py --check; then
   cat <<'MSG'
 
-Ready. Start the caller inside tmux (it keeps running if SSH drops):
+Ready. Start the dashboard inside tmux (stays idle until you click Start Batch):
     tmux new -s caller
-    .venv/bin/python pull_leads.py
+    .venv/bin/python dashboard_server.py
 Detach with Ctrl+B then D; come back with: tmux attach -t caller
 MSG
 else

@@ -43,8 +43,7 @@ can see how close each lead came. The 80% threshold is `INTEREST_THRESHOLD` in
 2. In `services.yaml`, copy an existing block, set a new `id`, `name` and `agent_id`.
 3. Write `description`, `good_fit` and `not_a_fit` (see tips below).
 4. Set `enabled: true`.
-5. Run a few real leads (e.g. `LIMIT = 3` in `main.py`) and check the
-   `prob_<id>` column and call outcomes in the results.
+5. Test scoring first without placing any calls (`python main.py path\to\leads.xlsx --score-only`), then run a small live test (`python main.py path\to\leads.xlsx --limit 3`) and check the `prob_<id>` column and call outcomes in the results.
 
 ## Writing good descriptions
 

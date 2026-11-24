@@ -1,23 +1,25 @@
 # dograh_caller
 
-Give it a list of businesses. It finds the ones likely to buy **Draftliner** or
-**Paradise Estimating** and has the right AI voice agent call them.
+Give it a list of businesses—or pull them on demand from the reverse-proxied lead streamer. It finds the ones likely to buy **Draftliner** or **Paradise Estimating** and has the right AI voice agent call them.
+
+> **Docs:** [Full reference](DOCUMENTATION.md) · [Going live](GO_LIVE.md) · [Service descriptions](SERVICES.md) · [Adding a service](ADDING_A_SERVICE.md) · [Lead streamer](lead_streamer/README.md)
 
 ## What it does
 
-1. **Reads your list** of businesses (a spreadsheet, or dicts sent by the scraper).
+1. **Reads your list** of businesses (a spreadsheet, Python dicts, or on-demand batches pulled directly from the reverse proxy at `https://ai-sdr.grobots.ai` — nothing is pulled or called automatically on startup).
 2. **Checks each phone number.** It keeps only real US numbers, and skips
    duplicates and businesses that were already called.
 3. **Asks Gemini (`gemini-3.8-flash`)** to score each enabled service (0–100%)
    and write a short explanation.
 4. **Calls the qualified businesses (≥ 80%).** For each service it creates a Dograh
    campaign, e.g. `Draftliner_2026-11-19`, and that service's agent makes the calls.
-5. **Saves everything** to `output/call_results.xlsx`, one row per business:
-   who was called, which service, and how the call went, plus per-lead
-   tracking in `output/pipeline_tracker.xlsx` for the dashboard.
+5. **Saves everything** to `output/call_results.xlsx` (one row per business) and
+   `output/transferred_calls.xlsx` (transferred leads), plus per-lead live tracking
+   in `output/pipeline_tracker.xlsx` for the web dashboard.
 
 ```
-your list ─► check numbers ─► Gemini: score services ─► Dograh campaign + agent calls ─► results & tracker
+https://ai-sdr.grobots.ai (Start Batch / Enter) ─┐
+or spreadsheet / Python list ────────────────────┴─► check numbers ─► Gemini ─► Dograh campaigns ─► Excel & Dashboard
 ```
 
 | Service | Dograh agent that calls |
@@ -63,18 +65,20 @@ streamer answers at `LEAD_SOURCE_URL`, and that it accepts the token.
 Copy this folder to the server **with its `.env`**, then:
 
 ```bash
-bash install.sh               # .venv + requirements + the --check above; no root needed
-tmux new -s caller            # keeps it running if your SSH connection drops
-.venv/bin/python main.py      # runs INPUT_FILE_PATH, then pulls from the streamer automatically
+bash install.sh                      # .venv + requirements + the --check above; no root needed
+tmux new -s caller                   # keeps it running if your SSH connection drops
+.venv/bin/python dashboard_server.py # starts idle; click Start Batch in the UI to pull/call leads
 ```
 
-Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. If the
-process is killed or the SSH session ends anyway, it stops the same way as
-Ctrl+C: this run's Dograh campaigns are paused and the unfinished batch is
-kept and continues on the next start.
+Detach with **Ctrl+B, D**; come back with `tmux attach -t caller`. Nothing is
+pulled or called on startup — leads are only pulled directly from the reverse
+proxy and called when you click **Start Batch** in the dashboard (or press Enter
+in `pull_leads.py`). If a running batch is stopped or interrupted, this run's
+Dograh campaigns are paused and the unfinished batch is kept and continues on
+the next start.
 
 On Windows: `python -m venv .venv`, `.venv\Scripts\pip install -r requirements.txt`,
-then `.venv\Scripts\python main.py`. (`bash install.sh` also works in Git Bash.)
+then `.venv\Scripts\python dashboard_server.py`. (`bash install.sh` also works in Git Bash.)
 
 Tests: `pip install -r requirements-dev.txt`, then `python -m pytest`.
 
@@ -100,23 +104,23 @@ fields that describe the business. Details: [DOCUMENTATION.md](DOCUMENTATION.md)
 **Step 2 — Point the program at your file.** Open [main.py](main.py) and edit the top:
 
 ```python
-INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"   # None = no file, streamer only
+INPUT_FILE_PATH = r"C:\path\to\your\leads.xlsx"   # None = no file
 LIMIT = None                                     # or 5 for only the first 5 businesses
-USE_STREAMER = True                              # keep pulling from the streamer after the file
+USE_STREAMER = False                             # False by default (never auto-pulls on startup)
 STREAMER_CHECK_SECONDS = 60
 ```
 
 **Step 3 — Run it:**
 
 ```bash
-python main.py                  # live: calls the file's qualified leads, then serves the streamer
+python main.py                           # live: calls only the configured file/list (does not auto-pull)
 python main.py leads.xlsx --score-only   # test scoring only; never calls Dograh
 ```
 
-After the file finishes, the program keeps running and checks the streamer every
-60 seconds. While the reverse proxy is not attached it only waits. Once the real
-streamer answers, it takes a batch, calls it completely, and takes the next one.
-Press **Ctrl+C** to stop.
+By default `USE_STREAMER = False`, so starting `main.py` never pulls or calls
+leads from the reverse proxy on its own. To pull and call leads from the
+reverse proxy on demand, use `python dashboard_server.py` (click **Start Batch**)
+or `python pull_leads.py` (press **Enter** to pull a batch).
 
 > ⚠️ **Normal runs are live.** Businesses that pass the 80% threshold really get called.
 > Pass `--score-only` to test verification and Gemini scoring safely without contacting Dograh or touching `output/call_results.xlsx`.
@@ -199,9 +203,9 @@ lead had. The file appears with the first transfer. In `call_results.xlsx` those
 | `dropped_...` | Phone problem: `not_us`, `invalid_number`, `special_number` (e.g. 900), `fax_only` (only fax numbers — fax numbers are never called), `duplicate`, `already_called`, `no_phone` |
 | `call_failed` / `call_timeout` | Dograh couldn't place the call, or it never finished |
 | `skipped_missing_data` | The agent's script needs information this business didn't have |
+| `interrupted` | Run stopped (`Stop` or `Ctrl+C`) before the lead finished |
 
-> **Keep this file.** It is also the program's memory of who was already called.
-> If you delete it, those businesses can be called again.
+> **Keep `output/call_results.xlsx` and `output/pipeline_tracker.xlsx`.** Together they track who was already called so earlier businesses are not called again.
 
 ---
 
@@ -209,34 +213,36 @@ lead had. The file appears with the first transfer. In `call_results.xlsx` those
 
 Setting it up on the servers for the first time: [GO_LIVE.md](GO_LIVE.md).
 
-The [lead streamer](lead_streamer/) runs on the scraper side and hands out leads
-at **`https://ai-sdr.grobots.ai`**, 300 per ping. Put its token in `.env`:
+The [lead streamer](lead_streamer/) runs behind the reverse proxy at
+**`https://ai-sdr.grobots.ai`** (`LEAD_SOURCE_URL`), serving up to 300 leads per
+request. Put its token in `.env`:
 
 ```ini
 LEAD_SOURCE_TOKEN=the-streamer's-STREAM_TOKEN
-# LEAD_SOURCE_URL=https://ai-sdr.grobots.ai   (default)
+# LEAD_SOURCE_URL=https://ai-sdr.grobots.ai   (default reverse proxy URL)
 ```
 
-Then run:
+Then start the dashboard (recommended) or interactive CLI:
 
 ```bash
-python main.py
+python dashboard_server.py   # starts idle; click Start Batch to pull from the reverse proxy and call
+# or:
+python pull_leads.py         # stays idle until you press Enter before each ping (including the first)
 ```
 
-1. It confirms the real streamer answers `/health`. Until then it just waits.
-2. It pings the streamer and receives one batch of up to **300** leads.
+1. On startup, nothing is pulled or called automatically.
+2. When you click **Start Batch** (or press **Enter** in `pull_leads.py`), it pings
+   `https://ai-sdr.grobots.ai/leads/next` directly through the reverse proxy and
+   receives up to **300** leads (or the requested batch size).
 3. It saves the batch to `output/pulled_batches/`, then processes **all** of it
    (check numbers → Gemini → campaigns → every call finished → results sheet).
-4. It immediately asks for the next batch. With no new leads, it checks again
-   every `STREAMER_CHECK_SECONDS`.
+4. Once the requested batch(es) finish, the runner stops automatically and waits
+   for your next explicit start (or next **Enter** in `pull_leads.py`).
 
-If it is stopped mid-batch (Ctrl+C, crash, error), the batch stays in
+If it is stopped mid-batch (Ctrl+C, Stop button, crash, error), the batch stays in
 `output/pulled_batches/*.pending.json` and is finished first on the next start,
 before any new leads are taken. That matters because the streamer marks leads as
 sent the moment it hands them out. Numbers that were already called are skipped.
-
-To approve every batch by hand instead, run `python pull_leads.py`: it waits for
-**Enter** before each ping.
 
 ## 7. Sending leads from other code
 
@@ -258,13 +264,13 @@ See [examples/from_python.py](examples/from_python.py) for streaming leads one b
 The web dashboard shows the live pipeline flow (`Incoming Leads → Number Verifier → Decision Maker → Qualified / Non-Qualified → Calling Agent → Call Results`, plus `Transferred Calls`) and lets you start or stop streamer batch runs from the top bar. Clients can see the conversion funnel and anything needing attention, open any stage, and read a lead's full story: AI reasoning, why it was or was not called, the recording and the conversation.
 
 ```bash
-python dashboard_server.py
+python dashboard_server.py   # optional: --host 127.0.0.1 --port 8090 --tracker PATH --demo
 ```
 
 Then open <http://127.0.0.1:8090>.
 
-- **What it reads:** `output/pipeline_tracker.xlsx`. Leads appear once a run has processed them, and the server does not need Node at runtime (it serves the pre-built `dashboard/static/` bundle).
-- **Start / Stop Batch:** click **Start Batch** in the top bar to pull 1–100 batches of 1–1,000 leads from the streamer and run the pipeline in the background (or click **Stop** to pause campaigns and keep unfinished leads pending for resume). In `--demo` mode, **Start Batch** runs an offline simulation without touching the streamer or Dograh.
+- **What it reads:** `output/pipeline_tracker.xlsx` (read-only snapshots; never locks the workbook). Leads appear as they progress through each stage, and the server serves the pre-built `dashboard/static/` bundle without needing Node at runtime.
+- **Start / Stop Batch:** starts **idle** on startup (`source_url` from `LEAD_SOURCE_URL` is shown in the **Start Lead Batch Run** dialog). Click **Start Batch** to pull 1–100 batches of 1–1,000 leads directly from the reverse proxy and run the pipeline in the background (or click **Stop** to pause Dograh campaigns and keep unfinished leads pending for resume). In `--demo` mode, **Start Batch** runs an offline simulation without touching the streamer or Dograh.
 - **Recordings and transcripts:** the server fetches them from Dograh with the key in `.env`. The key and the private file links never reach the browser.
 - **Security:** the dashboard has **no login**. By default it binds to `127.0.0.1:8090` (this computer only) and refuses requests for other host names. With a non-loopback `--host` it prints a warning, because anyone who can reach the address can see lead details, phone numbers, transcripts, recordings, and batch controls.
 
@@ -304,6 +310,8 @@ All settings: [DOCUMENTATION.md](DOCUMENTATION.md), section 4.
 | Warning `has unpublished changes` | Publish the agent in Dograh, or calls use the older version |
 | `FAILED to start '…'` | Dograh refused the campaign; the message says why |
 | `… is open in another program` | Close the results spreadsheet in Excel |
+| `Tracker is locked` / `HTTP 409` | Another pipeline run is active (`.pipeline_tracker.lock`); wait for it to finish or click **Stop** |
+| Intermittent TLS `Hostname mismatch` from `https://ai-sdr.grobots.ai` | Stale nginx workers on the scraper server; run `sudo nginx -t && sudo systemctl restart nginx` there (see [GO_LIVE.md](GO_LIVE.md#if-pull_leadspy---check-fails)) |
 
 ---
 

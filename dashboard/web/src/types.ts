@@ -46,6 +46,7 @@ export interface RunnerStatus {
   finished_at: string | null;
   message: string;
   error: string | null;
+  source_url?: string | null;
 }
 
 export interface SummaryResponse {

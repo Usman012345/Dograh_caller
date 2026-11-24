@@ -180,7 +180,23 @@ def test_main_without_input_stops_before_contacting_anything(monkeypatch, capsys
 
 def test_main_default_input_is_not_the_fictional_sample():
     assert caller_main.INPUT_FILE_PATH is None
+    assert caller_main.USE_STREAMER is False
     assert "sample_leads" not in str(caller_main.INPUT_FILE_PATH or "")
+
+
+def test_main_default_startup_does_not_auto_pull_or_call(monkeypatch, capsys):
+    import pull_leads
+
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    monkeypatch.setattr(pull_leads, "preflight", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not preflight")))
+    monkeypatch.setattr(pull_leads.Puller, "run_auto", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run_auto")))
+    monkeypatch.setattr(pull_leads.Puller, "run", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run puller")))
+    monkeypatch.setattr(caller_main, "run_leads_sync", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run pipeline")))
+
+    assert caller_main.main() == 1
+    out = capsys.readouterr().out
+    assert "No input set" in out
+    assert "dashboard_server.py" in out
 
 
 class _AutoSetup:

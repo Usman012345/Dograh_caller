@@ -12,13 +12,15 @@
 6. [Stage 1 — Number verifier](#6-stage-1--number-verifier)
 7. [Stage 2 — Decision maker (Gemini)](#7-stage-2--decision-maker-gemini)
 8. [Stage 3 — Campaigns](#8-stage-3--campaigns)
-9. [Stage 4 — Results spreadsheet](#9-stage-4--results-spreadsheet)
-10. [Concurrency model](#10-concurrency-model)
-11. [Python API reference](#11-python-api-reference)
-12. [Extending the system](#12-extending-the-system)
-13. [Troubleshooting](#13-troubleshooting)
-14. [Limitations and known behaviour](#14-limitations-and-known-behaviour)
-15. [Compliance](#15-compliance)
+9. [Stage 4 — Results, transfers, and pipeline tracker](#9-stage-4--results-transfers-and-pipeline-tracker)
+10. [Client Dashboard & Batch Runner](#10-client-dashboard--batch-runner)
+11. [Concurrency model](#11-concurrency-model)
+12. [Python API reference](#12-python-api-reference)
+13. [Extending the system](#13-extending-the-system)
+14. [Helper tools & testing](#14-helper-tools--testing)
+15. [Troubleshooting](#15-troubleshooting)
+16. [Limitations and known behaviour](#16-limitations-and-known-behaviour)
+17. [Compliance](#17-compliance)
 
 ---
 
@@ -39,34 +41,35 @@ ones. Every lead and its outcome is recorded in Excel (`call_results.xlsx` and `
 ## 2. System overview
 
 ```
-                 ┌───────────────────────────────────────────────────────────────────────────┐
-  AI-powered     │                               dograh_caller                               │
-  scraper  ──┐   │                                                                           │
-  (dicts)    ├──►│  Number verifier ──► Decision maker ──► per-service lists ──► Campaigns   │
-  .xlsx /    │   │   US numbers only     Gemini: P(fit)       Draftliner: [...]   one per    │
-  .csv /   ──┘   │   dedupe, E.164       per service ≥ 80%    Paradise:   [...]   service    │
-  .json          │        │                    │                                    │        │
-                 │        └── dropped ─────────┴── not interested ──────── outcome ─┘        │──► output/call_results.xlsx & pipeline_tracker.xlsx
-                 └───────────────────────────────────────────────────────────────────────────┘
+                                   ┌───────────────────────────────────────────────────────────────────────┐
+  Reverse proxy                    │                             dograh_caller                             │
+  https://ai-sdr.grobots.ai        │                                                                       │
+    (on-demand via Start Batch ───►│  Number verifier ──► Decision maker ──► per-service lists ──► Dograh  │
+     or Enter in pull_leads.py)    │   US numbers only     Gemini: P(fit)       Draftliner: [...]   calls  │
+  .xlsx / .csv / .json / Python ──►│   dedupe, E.164       per service ≥ 80%    Paradise:   [...]   (& retries)
+                                   │        │                    │                                    │    │
+                                   │        └── dropped ─────────┴── not_interested ──────── outcome ─┘    │
+                                   └───────────────────────────────────────────────────────────────────────┘
+                                                                        │
+                                    ┌───────────────────────────────────┼──────────────────────────────────┐
+                                    ▼                                   ▼                                  ▼
+                       output/call_results.xlsx        output/transferred_calls.xlsx      output/pipeline_tracker.xlsx
+                                                                                                           │
+                                                                                                           ▼
+                                                                                          Dashboard (http://127.0.0.1:8090)
+                                                                                          Start/Stop Batch · Funnel · Media
 ```
+
+**Idle-on-startup design:** starting the dashboard (`dashboard_server.py`), the interactive CLI (`pull_leads.py`), or `main.py` with defaults **never** pulls or calls leads automatically. Leads are only pulled directly from the configured reverse proxy (`LEAD_SOURCE_URL`, default `https://ai-sdr.grobots.ai`) when the user clicks **Start Batch** in the dashboard or presses **Enter** in `pull_leads.py`.
 
 **Lifecycle of a run**
 
-1. Leads (`dict`s) are submitted.
-2. The **verifier** finds the phone field, validates it and keeps it only if it
-   is a valid, not-yet-seen US number. Otherwise → row with `dropped_*` status.
-3. The **decision maker** asks Gemini for a probability and reason per enabled service
-   plus a two-line summary. Code checks the highest probability: if ≥ the threshold (80%),
-   the lead is added to that service's list. Otherwise → row with `not_interested` (shown as Non-Qualified in the dashboard).
-4. When all leads are scored, **one Dograh campaign per service** that has
-   interested leads is created automatically, named `<service name>_<date>`
-   (e.g. `Draftliner_2026-11-19`), using that service's agent and containing only
-   that service's numbers. The campaigns are started and run in parallel.
-5. Each call (and Dograh's automatic retries) is followed until the lead has a
-   final outcome → row with `called` (or `call_failed` / `call_timeout`).
-6. The **results store** writes each row into today's block of the spreadsheet.
-
-Campaigns appear on the Dograh dashboard under **Campaigns**.
+1. **Pull or load leads:** on-demand jobs pull a batch (saved first to `output/pulled_batches/*.pending.json`) directly from the reverse proxy, or a local file/Python iterable submits lead `dict`s.
+2. **Number verifier:** finds the phone field(s), excludes fax numbers, validates format/region/type, blocks numbers already called in earlier runs, and keeps valid US numbers. Otherwise → `dropped_*`.
+3. **Decision maker:** asks Gemini (`gemini-3.8-flash`) for a probability (0–100%) and one-sentence reason per enabled service plus a two-sentence summary. Code applies `INTEREST_THRESHOLD` (80%): if the highest probability ≥ 80%, the lead is queued for that service's campaign; otherwise → `not_interested` (labelled **Non-Qualified** in the dashboard).
+4. **Campaigns:** once a batch's leads are scored, **one Dograh campaign per service** with qualified leads is created automatically, named `<service name>_<date>` (e.g. `Draftliner_2026-11-19`), using that service's published Dograh agent. Campaigns run in parallel and are paused automatically when finished or stopped.
+5. **Call tracking:** each call attempt (and Dograh retry) is followed until a final outcome (`called`, `call_failed`, `call_timeout`, or `interrupted`).
+6. **Persistence & live UI:** `output/call_results.xlsx` records one row per lead grouped by day; `output/transferred_calls.xlsx` collects transferred calls; `output/pipeline_tracker.xlsx` tracks every lead across stages in near real time for the FastAPI + React dashboard.
 
 ---
 
@@ -74,23 +77,23 @@ Campaigns appear on the Dograh dashboard under **Campaigns**.
 
 ```
 dograh_caller/
-├── main.py              Command-line entry point (reads .xlsx / .csv / .json, supports --score-only)
-├── pull_leads.py        Pulls 300-lead batches from the lead streamer (automatic via main.py, or manual)
-├── dashboard_server.py  FastAPI + React dashboard server (monitoring and Start/Stop batch runner)
+├── main.py              Command-line entry point (file / Python runs, supports --score-only; USE_STREAMER=False by default)
+├── pull_leads.py        Interactive CLI puller & --check tool (waits for Enter before every ping, including the first)
+├── dashboard_server.py  FastAPI + React dashboard server (stays idle until Start Batch; --demo mode supported)
 ├── install.sh           Server setup: .venv, requirements, `pull_leads.py --check`
 ├── GO_LIVE.md           Steps to put https://ai-sdr.grobots.ai live (streamer, nginx, DNS, certbot)
 ├── requirements-dev.txt Test dependencies (pytest, httpx, psycopg for the streamer tests)
-├── pipeline.py          LeadPipeline: queues, workers, logging, summary
-├── pipeline_tracker.py  Per-lead Excel tracker (output/pipeline_tracker.xlsx)
-├── lead_fields.py       Reading unstructured leads (field-name words, nesting, JSON text)
+├── pipeline.py          LeadPipeline: asyncio queues, stage workers, campaign flush, stop_event, summary
+├── pipeline_tracker.py  Per-lead Excel tracker (output/pipeline_tracker.xlsx) with .pipeline_tracker.lock
+├── lead_fields.py       Helpers for unstructured leads (field-name words, nesting, JSON text)
 ├── number_verifier.py   Stage 1 – phone validation (US only, never fax)
-├── decision_maker.py    Stage 2 – Gemini scoring, service loading
-├── campaign_manager.py  Stage 3 – one campaign per service: create, start, follow calls
+├── decision_maker.py    Stage 2 – Gemini structured scoring, service loading, check_gemini_access()
+├── campaign_manager.py  Stage 3 – one campaign per service: create, start, follow calls & retries
 ├── dograh_client.py     Dograh HTTP client (agents, CSV upload, campaigns, runs)
-├── results_store.py     Stage 4 – .xlsx writer
-├── config.py            All settings (read from .env / environment)
+├── results_store.py     Stage 4 – call_results.xlsx and transferred_calls.xlsx writer
+├── config.py            All settings (read from environment and .env)
 ├── services.yaml        Our services, as described to Gemini  ← edit this to add services
-├── dashboard/           Dashboard backend (data.py, app.py, media.py, demo_media.py) and React frontend (web/ -> static/)
+├── dashboard/           Dashboard backend (app.py, data.py, media.py, demo_media.py, runner.py) & React UI (web/ -> static/)
 ├── tools/               Helper scripts (make_demo_tracker.py, compare_scores.py)
 ├── requirements.txt
 ├── README.md            Quick start
@@ -103,7 +106,10 @@ dograh_caller/
 │   ├── from_python.py   Feeding dicts from Python code (scraper integration)
 │   └── sample_leads.xlsx  Test leads with fictional 555-01xx numbers
 └── output/              Created on first run
-    └── call_results.xlsx
+    ├── call_results.xlsx
+    ├── transferred_calls.xlsx
+    ├── pipeline_tracker.xlsx
+    └── pulled_batches/  Saved *.pending.json / *.done.json streamer batches
 ```
 
 ---
@@ -141,7 +147,7 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 | `LEAD_MAX_STATE_CHARS` | `12000` | Most characters Gemini gets per lead in total (most useful fields first) |
 | `INTEREST_THRESHOLD` | `0.80` | Minimum probability for a lead to be qualified/called |
 | `ALLOWED_PHONE_REGIONS` | `US` | Phone regions accepted, comma-separated ISO codes. `US,PR,VI,GU,MP,AS` adds the US territories |
-| `SKIP_ALREADY_CALLED` | `true` | Block numbers already called in earlier runs (read from the results sheet) |
+| `SKIP_ALREADY_CALLED` | `true` | Block numbers already called in earlier runs (read from `call_results.xlsx` — including timestamped fallback copies — and `pipeline_tracker.xlsx`) |
 | `SERVICES_FILE` | `services.yaml` | Service definitions |
 | `DOGRAH_API_KEY` | — | Dograh API key (required to place calls) |
 | `DOGRAH_BASE_URL` | `https://dograh.grobots.ai/api/v1` | Dograh API base URL, must end in `/api/v1` |
@@ -168,8 +174,8 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 | `DASHBOARD_REFRESH_SECONDS` | `5` | Dashboard polling interval |
 | `TRANSFERS_FILE` | `output/transferred_calls.xlsx` | Only businesses whose call was transferred, with their details |
 | `TRANSFER_DISPOSITIONS` | `transfer_call,call_transferred` | Dispositions/tags that mean "transferred" (Dograh's defaults). Add the disposition you set on a transfer tool if it doesn't contain "transfer". Anything containing "transfer" but not "fail" also counts |
-| `LEAD_SOURCE_URL` | `https://ai-sdr.grobots.ai` | Lead streamer address pinged by `pull_leads.py` (`<url>/leads/next`) |
-| `LEAD_SOURCE_TOKEN` | — | The streamer's `STREAM_TOKEN` (alias `STREAM_TOKEN`); required by `pull_leads.py` |
+| `LEAD_SOURCE_URL` | `https://ai-sdr.grobots.ai` | Lead streamer reverse proxy URL (alias `STREAMER_URL`), used by `dashboard_server.py` (`BatchRunner`) and `pull_leads.py` (`<url>/leads/next`) |
+| `LEAD_SOURCE_TOKEN` | — | The streamer's `STREAM_TOKEN` (alias `STREAM_TOKEN`); required by `BatchRunner` and `pull_leads.py` |
 | `LEAD_SOURCE_TIMEOUT` | `180` | Seconds to wait for a ping's answer (minimum 120) |
 | `PULLED_BATCHES_DIR` | `output/pulled_batches` | Received batches (`.pending.json` until fully processed, then `.done.json`) |
 | `RESULTS_MAX_LEAD_COLUMNS` | `80` | Most lead fields with their own column; further fields go (as JSON) into `other_lead_fields` |
@@ -178,19 +184,38 @@ DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 
 ## 5. Running the pipeline
 
-### Input variables in `main.py`
+### Recommended: Dashboard server (on-demand reverse proxy)
+
+```bash
+python dashboard_server.py
+```
+
+- Starts **idle** at `http://127.0.0.1:8090` (`Lead source (reverse proxy): https://ai-sdr.grobots.ai`). Nothing is pulled or called until you click **Start Batch** (or `POST /api/runner/start`).
+- Choose `Leads per batch` (`1`–`1,000`, default `300`) and `Number of batches` (`1`–`100`, default `1`), or click **Stop** at any time to pause active Dograh campaigns and keep unfinished batches pending for resume.
+- Pass `--demo` to preview the UI with ~60 fictional leads and offline simulated batch runs. See [§10](#10-client-dashboard--batch-runner) for all options and API details.
+
+### Interactive terminal puller (`pull_leads.py`)
+
+```bash
+python pull_leads.py --check   # validate keys, Dograh agents, reverse proxy /health and /stats (takes no leads)
+python pull_leads.py           # stays idle until you press Enter before every ping (including the first)
+```
+
+Options: `--url <URL>`, `--threshold <0-1>`, `--output <path.xlsx>`, `--check`.
+
+### File / Python / `--score-only` runs (`main.py`)
 
 Edit the **INPUT** section at the top of [main.py](main.py), then run `python main.py`.
-Every run is **live**: leads that pass the threshold are called.
+Every run without `--score-only` is **live**: leads that pass the threshold are called.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json) called when `python main.py` starts. Relative paths are relative to `dograh_caller/`. `None` = streamer only. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
+| `INPUT_FILE_PATH` | `None` | Leads file (.xlsx / .csv / .json) called when `python main.py` starts. Relative paths are relative to `dograh_caller/`. Don't point it at `examples/sample_leads.xlsx` (fictional numbers). |
 | `INPUT_SHEET` | `None` | Worksheet to read (`None` = first sheet) |
 | `INPUT_LEADS` | `[]` | Lead dicts, e.g. from the scraper. Processed together with the file if both are set. |
 | `LIMIT` | `None` | Process only the first N leads of the file |
-| `USE_STREAMER` | `True` | After the file, keep pulling batches from the lead streamer. `False` = process the file and exit |
-| `STREAMER_CHECK_SECONDS` | `60` | Wait between streamer checks while it is not attached or has no new leads |
+| `USE_STREAMER` | `False` | `False` by default so starting `main.py` never auto-pulls or auto-calls leads. Set `True` only if you explicitly want unattended polling after the file |
+| `STREAMER_CHECK_SECONDS` | `60` | Wait between streamer checks when `USE_STREAMER = True` |
 
 ### From other code: `run()`
 
@@ -361,13 +386,13 @@ File: [decision_maker.py](decision_maker.py) · Class: `DecisionMaker`
 - Example: a 41,000-character streamer lead becomes ~2,500 characters of
   company, category, services, description (capped), size and location.
 
-**Structured scoring:** one Gemini request per lead (`gemini-3.8-flash`, reasoning
-level `GEMINI_THINKING_LEVEL`) evaluates every enabled service from `services.yaml`
-and returns a structured JSON object with:
+**Structured scoring:** one Gemini request per lead (`GEMINI_MODEL`, default `gemini-3.8-flash`, reasoning level `GEMINI_THINKING_LEVEL`) evaluates every enabled service from `services.yaml` using `HttpOptions` with `GEMINI_TIMEOUT_SECONDS` (60s) and `GEMINI_MAX_ATTEMPTS` (4 attempts with exponential backoff on HTTP 408/429/500/502/503/504), and returns a structured JSON object with:
 - `services`: for each service, an integer `probability_percent` (0–100) and a
   one-sentence `reason` citing evidence from the lead;
 - `summary`: a two-short-sentence explanation of what the business does and why
   it does or does not fit its best-matching service.
+
+Before taking leads from the streamer, `preflight()` runs `check_gemini_access()` (`client.models.get(model=...)`) to verify the API key and model access without consuming leads or generating content.
 
 ### Routing rule
 
@@ -381,6 +406,10 @@ Code applies the threshold (Gemini is not told the cutoff) and generates the
 `verdict` text. One lead is called at most once, by one agent. Every service's
 probability is saved as `prob_<id>`, its reason as `decision_reason_<id>`, and
 full per-lead reasoning is persisted in `output/pipeline_tracker.xlsx`.
+
+**Failed Gemini scoring (`decision_error`):** if a lead fails Gemini scoring after retries, it is never treated as non-qualified. Instead it is recorded as `decision_error` and saved for retry:
+- For **streamer / dashboard runs**, failed leads are saved as a new `batch_*.pending.json` in `output/pulled_batches/` (`source="decision_retry"`) so the next batch run retries them automatically.
+- For **file / Python runs** (`main.run()`), failed leads are written to `output/decision_retry_<timestamp>.json` with a ready-to-run `python main.py ...` command.
 
 ---
 
@@ -490,12 +519,13 @@ Use them in the agent's prompts as `{{company}}`, `{{location}}`,
 
 ---
 
-## 9. Stage 4 — Results spreadsheet
+## 9. Stage 4 — Results, transfers, and pipeline tracker
 
-File: [results_store.py](results_store.py) · Class: `ResultsStore`
+### `output/call_results.xlsx` (`ResultsStore`)
 
-- Sheet `results` in `output/call_results.xlsx` (or `--output`). Created on first
-  use and reused on later runs. Header row is frozen and styled.
+File: [results_store.py](results_store.py) · Class: `ResultsStore` · Sheet: `results`
+
+- Created on first use and reused on later runs. Header row is frozen and styled.
 - One row per submitted lead, whatever happened to it.
 - **Grouped by day, newest day on top:**
 
@@ -513,26 +543,28 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
   new day's block on top, while the run keeps using the same campaigns.
   The day comes from `processed_at` (local time). Files written in an older
   layout are regrouped into this layout when opened.
-- New services add `prob_<id>` columns automatically. Lead fields get their
+- New services add `prob_<id>` and `decision_reason_<id>` columns automatically. Lead fields get their
   own columns too, up to `RESULTS_MAX_LEAD_COLUMNS` (80) — leads are
   unstructured, so without a limit every new field name would widen the sheet.
   Fields beyond the limit are kept, as JSON, in the `other_lead_fields` column.
 - Nested lead values (dicts, lists) are stored as JSON in one cell.
+- **Excel safety:** `clean_excel_text()` strips XML-disallowed control characters (`ILLEGAL_CHARACTERS_RE`), strings longer than 32,000 characters are truncated, and any string starting with `=` is stored with `cell.data_type = "s"` so scraped text cannot become an Excel formula.
 - **A lead field never overwrites anything.** If its name is one of this
   program's columns (e.g. the scraper's own `status`, `detail`), it is stored
   as `lead.<name>` — always the same column, so the scraper's `status` is
   always in `lead.status` and our `status` stays ours. The lead's other fields
   (e.g. its `lead_status`) are untouched.
-- Saving is batched: the file is written whenever the queue of pending rows is empty.
+- Saving is batched and atomic (written to a temporary file then swapped in via `os.replace`) whenever the queue of pending rows is empty.
 - If the file is open in Excel (locked), the pipeline warns and keeps retrying;
   at shutdown it retries for 60 s and then saves a timestamped copy
-  (`call_results_YYYYMMDD_HHMMSS.xlsx`).
+  (`call_results_YYYYMMDD_HHMMSS.xlsx`). `load_called_numbers()` reads both `call_results.xlsx` and its timestamped fallback copies.
 
-### Columns
+#### Columns (`call_results.xlsx`)
 
 | Column | Description |
 |---|---|
 | `processed_at` | When the row was written |
+| `pipeline_lead_id` | Sequential tracker ID (`L000001`, ...) matching `pipeline_tracker.xlsx` |
 | `status` | See table below |
 | `detail` | Error text or extra info |
 | `phone_raw` | Phone as received |
@@ -554,7 +586,7 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | `other_lead_fields` | Lead fields beyond the column limit (JSON) |
 | *lead fields* | Original fields; stored as `lead.<name>` if the name is one of the columns above |
 
-### Status values
+#### Status values
 
 | Status | Meaning |
 |---|---|
@@ -566,11 +598,79 @@ File: [results_store.py](results_store.py) · Class: `ResultsStore`
 | `call_failed` | Campaign couldn't be created/started, the number was never dialed (including before an idle timeout), or Dograh couldn't be reached |
 | `call_timeout` | A dialed call never finished before `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without campaign progress |
 | `decision_error` | Gemini request or validation failed after retries; lead is saved for retry |
+| `interrupted` | Run stopped (`Stop` button or `Ctrl+C`) before the lead reached a final outcome |
 | `error` | Unexpected error in the verifier |
+
+### `output/transferred_calls.xlsx` (`TRANSFERS_FILE`)
+
+- Sheet: `transferred` (`TRANSFERS_SHEET_NAME`), created on the first transferred call (`is_transferred()` matches `TRANSFER_DISPOSITIONS` — default `transfer_call`, `call_transferred` — or any disposition/tag containing `"transfer"` without `"fail"`).
+- Fixed leading columns (`TRANSFER_COLUMNS`): `transferred_at`, `phone_called`, contact details (`business`, `contact_name`, `contact_title`, `email`, `website`, `address`, `city`, `state`, `postal_code`, `category`, `lead_id`), call summary (`interested_service`, `campaign_name`, `agent_name`, `call_disposition`, `call_duration_s`, `collected_by_agent`, `transcript_url`, `recording_url`, `dograh_run_id`), and `other_lead_fields`.
+
+### `output/pipeline_tracker.xlsx` (`PipelineTracker`)
+
+File: [pipeline_tracker.py](pipeline_tracker.py) · Class: `PipelineTracker` · Sheet: `leads`
+
+- **Purpose:** per-lead state machine backing the live dashboard. Unlike `call_results.xlsx` (written when a lead finishes), `pipeline_tracker.xlsx` registers every lead on arrival (`L000001`, `L000002`, ...) and updates its row at each stage transition (`incoming` → `awaiting_decision` → `qualified_waiting` → `calling` → final stages `number_rejected`, `non_qualified`, `decision_error`, `not_sent`, `scored_qualified`, `call_finished`, `interrupted`).
+- **Single-writer lock:** opening `PipelineTracker` acquires `output/.pipeline_tracker.lock` (using exclusive file creation + PID/host liveness detection). A second live pipeline run refuses to start with `TrackerLockedError` while another run holds the lock; the dashboard server only reads snapshots and never locks it.
+- **Atomic periodic saves & chunked JSON:** a background `_tracker_worker` flushes dirty state atomically (`os.replace`) at least every `TRACKER_SAVE_SECONDS` (3s). Large `lead_json` / `dograh_json` payloads are split across `lead_json_2`, `dograh_json_2`, ... in 16,000-character chunks to stay under Excel's cell limit, sensitive keys (`token`, `secret`, `password`, `api_key`, `authorization`, `credential`, e.g. `public_access_token`) are stripped by `sanitize_dograh_data()`, and `called_numbers()` feeds `SKIP_ALREADY_CALLED`.
 
 ---
 
-## 10. Concurrency model
+## 10. Client Dashboard & Batch Runner
+
+Files: [dashboard_server.py](dashboard_server.py) · [dashboard/app.py](dashboard/app.py) · [dashboard/data.py](dashboard/data.py) · [dashboard/runner.py](dashboard/runner.py) · [dashboard/media.py](dashboard/media.py) · [dashboard/demo_media.py](dashboard/demo_media.py)
+
+### Starting the server
+
+```bash
+python dashboard_server.py [--host 127.0.0.1] [--port 8090] [--tracker PATH] [--demo]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host` | `DASHBOARD_HOST` (`127.0.0.1`) | Bind address. Loopback binds (`127.0.0.1`, `localhost`, `::1`) restrict `Host` headers to loopback names to block DNS rebinding; non-loopback binds print a prominent no-login security warning. |
+| `--port` | `DASHBOARD_PORT` (`8090`) | HTTP listen port |
+| `--tracker` | `PIPELINE_TRACKER_FILE` | Workbook to read (or `output/demo_tracker.xlsx` under `--demo`) |
+| `--demo` | off | Generates ~60 fictional leads + `DemoMedia` transcripts/audio and simulates **Start Batch** offline without touching Dograh or the reverse proxy |
+
+Security headers applied to all responses: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict `Content-Security-Policy` (`default-src 'self'`), and `Cache-Control: no-store` on all `/api/*` endpoints.
+
+### `BatchRunner` lifecycle (`dashboard/runner.py`)
+
+- **Idle at startup:** `create_app()` initializes `BatchRunner` in `"idle"` (`active=false`) and never pings `LEAD_SOURCE_URL` or launches pipelines automatically.
+- **Starting a run (`POST /api/runner/start`):** validates `batch_size` (`1`–`1,000`, default `300`) and `num_batches` (`1`–`100`, default `1`); rejects overlapping runs with `HTTP 409`. In live mode, runs `preflight()` (checking `LEAD_SOURCE_URL`, `LEAD_SOURCE_TOKEN`, `GEMINI_API_KEY`, `INTEREST_THRESHOLD`, `GEMINI_THINKING_LEVEL`, `services.yaml`, and Dograh agents) and verifies `PipelineTracker.assert_unlocked()`.
+- **Direct reverse-proxy pull & resume:** for each requested batch, finishes any saved `output/pulled_batches/*.pending.json` first; otherwise pings `GET <LEAD_SOURCE_URL>/leads/next?limit=<batch_size>`, saves the batch atomically to `output/pulled_batches/`, processes it end-to-end through `default_process()`, refreshes the dashboard cache, marks the batch `.done.json`, and stops automatically (`state="completed"`) when finished or when the streamer returns `no_new_leads`.
+- **Stopping (`POST /api/runner/stop`):** sets `stop_event`, triggering cooperative cancellation across pipeline queues and `CampaignJob.monitor()`, pausing active Dograh campaigns, marking unfinished leads `interrupted`, and leaving the `.pending.json` batch on disk for resume.
+
+### HTTP API endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/health` | `GET` | Server status, `tracker_found`, and `stale` flag |
+| `/api/summary` | `GET` | Funnel node counts (`incoming`, `number_verifier`, `decision_maker`, `non_qualified`, `qualified`, `calling_agent`, `call_results`, `transferred`), `activity`, `services`, `threshold`, and embedded `runner` status (including `source_url`) |
+| `/api/runner` | `GET` | Current `BatchRunner` state (`idle`, `running`, `stopping`, `completed`, `stopped`, `error`) |
+| `/api/runner/start` | `POST` | Start a batch run (`{"batch_size": 1..1000, "num_batches": 1..100}`, defaults `300` and `1`) |
+| `/api/runner/stop` | `POST` | Request cooperative stop of the active batch run |
+| `/api/leads` | `GET` | Paginated, searchable, sortable rows for `view` ∈ `incoming`, `number_verifier`, `decision_maker`, `non_qualified`, `qualified`, `calling_agent`, `call_results`, `transferred`, with optional `service`, `filter`, `q`, `sort`, `order`, `page`, `page_size` (1–200) |
+| `/api/leads/{lead_id}` | `GET` | Full per-lead detail: lifecycle `journey`, `number_check`, `decision` scores & reasons, `call` outcome & `audio_tracks`, and sanitized `lead_fields` |
+| `/api/leads/{lead_id}/transcript` | `GET` | Parsed conversation `turns` (`agent` / `customer` / `other`) fetched via `DograhMedia` |
+| `/api/leads/{lead_id}/audio/{track}` | `GET` | Range-capable audio stream for `track` ∈ `recording`, `agent`, `customer` proxied through `DograhMedia` |
+
+`DograhMedia` ([dashboard/media.py](dashboard/media.py)) validates storage keys (`recordings/...` or `transcripts/...` recorded on that lead), requests short-lived signed URLs from Dograh using `DOGRAH_API_KEY`, and streams content through the server so neither `DOGRAH_API_KEY` nor Dograh's signed URLs / `public_access_token` ever reach the browser.
+
+### Frontend build (`dashboard/web/` → `dashboard/static/`)
+
+At runtime `dashboard_server.py` serves pre-built static files from `dashboard/static/` without needing Node. To modify the React UI in `dashboard/web/src/`:
+
+```bash
+cd dashboard/web
+npm install
+npm run build   # runs tsc && vite build into dashboard/static/
+```
+
+---
+
+## 11. Concurrency model
 
 The pipeline is built on `asyncio` (see [pipeline.py](pipeline.py)):
 
@@ -580,6 +680,7 @@ The pipeline is built on `asyncio` (see [pipeline.py](pipeline.py)):
 | Decision maker | `DECISION_CONCURRENCY` (8) | `decision` queue (max `QUEUE_MAXSIZE`) |
 | Campaigns | one monitor task per campaign, all in parallel | per-service lists, launched by `flush()` / `close()` |
 | Results writer | 1 | `results` queue (unbounded) |
+| Tracker saver | 1 (`_tracker_worker`) | Periodic atomic save every `TRACKER_SAVE_SECONDS` |
 
 - **Concurrent scoring:** leads are verified and scored by Gemini while more are
   still being submitted.
@@ -590,32 +691,37 @@ The pipeline is built on `asyncio` (see [pipeline.py](pipeline.py)):
   per minute).
 - **Blocking HTTP** (Dograh via `requests`) runs in worker threads
   (`asyncio.to_thread`); Gemini uses its async `client.aio` API.
+- **Cooperative stop (`stop_event`):** checked across `submit()`, `flush()`, `run_leads()`, and `CampaignJob.monitor()`. When set, pending queues and uncompleted calls are marked `interrupted`, live campaigns are paused, and stores are saved cleanly.
 - **Shutdown:** `close()` runs `flush()` (score everything, run the campaigns,
   wait for all calls), then stops the workers, pauses any campaign of this run
-  still running, saves the sheet and prints the summary. On `Ctrl+C` or an error
+  still running, saves `call_results.xlsx`, `transferred_calls.xlsx`, and `pipeline_tracker.xlsx`, and prints the summary. On `Ctrl+C`, `stop_event`, or an error,
   it skips the flush but still pauses the campaigns and saves.
-- **Batches:** `run_leads()` calls `flush()` after every `LEAD_BATCH_SIZE`
+- **Batches:** `run_leads()` calls `flush()` after every `batch_size` (`LEAD_BATCH_SIZE` = 300 by default)
   leads, so each batch is completely called before the next is taken.
-- **No persistence:** queues are in memory only. Stopping the process loses
-  leads that were not yet written to the sheet.
+- **Persistence:** in-flight queues live in memory only, while pulled streamer batches remain on disk as `*.pending.json` until completed and `pipeline_tracker.xlsx` saves periodically every `TRACKER_SAVE_SECONDS`.
 
 ---
 
-## 11. Python API reference
+## 12. Python API reference
 
 ### `LeadPipeline` ([pipeline.py](pipeline.py))
 
 ```python
 LeadPipeline(
-    results_file: str | Path = None,   # default RESULTS_FILE
+    results_file: str | Path = None,   # default RESULTS_FILE (or score_only_<ts>.xlsx if score_only=True)
     threshold: float = None,           # default INTEREST_THRESHOLD
     services_file: str | Path = None,  # default services.yaml
+    score_only: bool = False,          # True = skip Dograh entirely
+    tracker_file: str | Path = None,   # default PIPELINE_TRACKER_FILE (or <results_stem>_tracker.xlsx if score_only)
+    source_label: str = "python",
+    stop_event: Any = None,            # optional threading.Event for cooperative cancellation
 )
-await pipeline.start()                 # load services, resolve agents, start workers
+await pipeline.start()                 # acquire tracker lock, resolve agents, start workers
 await pipeline.submit(lead: dict)      # add one lead (waits if queues are full)
 await pipeline.flush()                 # score what's submitted, run one campaign per service, wait for calls
-await pipeline.close()                 # flush, save, print summary
+await pipeline.close(abort=False)      # flush (unless abort), pause campaigns, save stores & tracker
 pipeline.stats                         # Counter of statuses
+pipeline.failed_decision_leads         # list of leads that hit decision_error
 ```
 
 Use it as an async context manager (`start` / `close` are called for you):
@@ -629,38 +735,34 @@ async with LeadPipeline() as pipeline:
 ### Helpers
 
 ```python
-await run_leads(leads, **pipeline_kwargs)   # leads: list / generator / async generator of dicts
-run_leads_sync(leads, **pipeline_kwargs)    # blocking version for normal scripts
+await run_leads(leads, batch_size=None, failed_leads=None, stop_event=None, **pipeline_kwargs)
+run_leads_sync(leads, batch_size=None, failed_leads=None, stop_event=None, **pipeline_kwargs)
+
+from main import run
+run(source, *, sheet=None, limit=None, threshold=None, output=None,
+    score_only=False, source_label=None, on_failed=None) -> int
 ```
 
-### Scraper integration
+### Scraper & Reverse Proxy integration
 
-**Lead streamer (live setup).** `python main.py` first runs `INPUT_FILE_PATH`, then runs
-unattended. It confirms `GET /health` reports the real streamer (no token is sent), pings
-`GET https://ai-sdr.grobots.ai/leads/next` (`Authorization: Bearer <LEAD_SOURCE_TOKEN>`),
-gets one batch of up to 300 leads, saves it to `PULLED_BATCHES_DIR`, runs it through
-`run_leads()` until every call is finished, and takes the next batch. `python pull_leads.py`
-is the manual alternative: it asks a person (Enter = next ping, `q` = quit) instead of continuing.
+**Lead streamer (live reverse-proxy setup).** Nothing is pulled or called on startup.
+Use `python dashboard_server.py` (click **Start Batch**) or `python pull_leads.py`
+(press **Enter** before each ping, including the first) to pull batches directly from
+the reverse proxy `GET https://ai-sdr.grobots.ai/leads/next` (optionally with `?limit=<batch_size>`, `Authorization: Bearer <LEAD_SOURCE_TOKEN>`),
+save each batch to `PULLED_BATCHES_DIR`, and run it through `run_leads()` until every
+call is finished. `main.py` has `USE_STREAMER = False` by default; `Puller.run_auto()`
+is only used if `USE_STREAMER` is explicitly set to `True` in `main.py`.
 
-| Streamer answer | `python main.py` (automatic) | `python pull_leads.py` (manual) |
-|---|---|---|
-| `/health` is not the live streamer | wait, check again | not checked before a ping |
-| `200 "ok"` + leads | save → process fully → next ping | save → process fully → ask |
-| `200 "no_new_leads"` | check again every `STREAMER_CHECK_SECONDS` | say so → ask |
-| `503` busy / database down | wait for `retry_after_seconds` or the check interval, whichever is longer | show it → ask |
-| `404`, an HTML page, network error, timeout | explain once → check again | explain → ask |
-| `401` token / `421` host | stop (exit code 2): configuration problem | stop (exit code 2) |
+| Streamer answer | Dashboard (`BatchRunner`) | Interactive CLI (`pull_leads.py`) | Opt-in Auto (`USE_STREAMER=True`) |
+|---|---|---|---|
+| `/health` is not the live streamer | not polled on startup; errors on `/leads/next` failure | not checked before a ping | waits, checks again every `STREAMER_CHECK_SECONDS` |
+| `200 "ok"` + leads | save → process `N` batches → stop idle | save → process fully → ask | save → process fully → next ping |
+| `200 "no_new_leads"` | complete early (`state="completed"`) | say so → ask | check again every `STREAMER_CHECK_SECONDS` |
+| `503` busy / database down | finish with `state="error"` (safe to retry) | show it → ask | wait `retry_after_seconds` or check interval |
+| `404`, HTML page, TLS/network error, timeout | finish with `state="error"` (no leads consumed if pre-HTTP) | explain → ask | explain once → check again |
+| `401` token / `421` host / `503 schema_mismatch` | finish with `state="error"` (fix `.env` / proxy) | stop (exit code 2) | stop (exit code 2) |
 
-In automatic mode an unfinished batch is always completed before new leads are taken, and
-failed batches or failed Gemini scoring retry with a growing wait, up to one hour.
-
-Before the first ping it checks the Gemini key and model access, `services.yaml` and each Dograh
-agent, so no leads are taken while the caller can't use them. `python pull_leads.py --check` runs
-the same checks plus the streamer's `/health` and `/stats` (token) and exits
-without taking any leads. SIGTERM and SIGHUP (kill, a dropped SSH session) are
-handled like Ctrl+C: campaigns are paused and the batch is kept. An interrupted batch
-(`*.pending.json`) is continued (automatic) or offered (manual) at the next start. The streamer's side of
-this agreement is in [lead_streamer/LEAD_STREAMER_SPEC.md](lead_streamer/LEAD_STREAMER_SPEC.md) §7, §12, §16.
+Unfinished batches (`*.pending.json`) are always finished before new leads are taken (on Dashboard **Start Batch**, CLI resume prompt, or auto mode). In all modes `preflight()` validates Gemini (`check_gemini_access`), `services.yaml`, each Dograh agent, and reverse-proxy settings before pulling leads. `python pull_leads.py --check` runs the same checks plus the streamer's `/health` and `/stats` (with token) and exits without taking any leads. SIGTERM and SIGHUP are turned into `SIGINT` (`stop_signals_act_like_ctrl_c()`) so campaigns pause cleanly and pending batches are preserved. See [lead_streamer/LEAD_STREAMER_SPEC.md](lead_streamer/LEAD_STREAMER_SPEC.md) §7, §12, §16 for the streamer contract.
 
 **In-process.**
 
@@ -694,11 +796,11 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 ---
 
-## 12. Extending the system
+## 13. Extending the system
 
 | Task | How |
 |---|---|
-| Add a service | Add a block to [services.yaml](services.yaml) with its own `agent_id`; no code change. See [SERVICES.md](SERVICES.md). |
+| Add a service | Add a block to [services.yaml](services.yaml) with its own `agent_id`; no code change. See [SERVICES.md](SERVICES.md) and [ADDING_A_SERVICE.md](ADDING_A_SERVICE.md). |
 | Change which agent calls a service | Change its `agent_id` in services.yaml. |
 | Pause a service | `enabled: false`. |
 | Be stricter / looser | `INTEREST_THRESHOLD` in `.env` or `--threshold`. |
@@ -711,7 +813,36 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 ---
 
-## 13. Troubleshooting
+## 14. Helper tools & testing
+
+### `tools/compare_scores.py`
+
+Compares a `--score-only` workbook against historical `call_results.xlsx` scores (matched by `phone_e164`) with phone numbers masked:
+
+```bash
+python tools/compare_scores.py output/score_only_20261124_120000.xlsx output/call_results.xlsx
+```
+
+### `tools/make_demo_tracker.py`
+
+Generates ~60 fictional leads (names containing `"Fictional"`, `555-01xx` phone numbers) across every pipeline stage and refuses to overwrite the live `PIPELINE_TRACKER_FILE`:
+
+```bash
+python tools/make_demo_tracker.py --out output/demo_tracker.xlsx
+```
+
+### Automated test suite
+
+All tests run 100% offline using local HTTP servers, local TLS reverse proxies, and fake Gemini/Dograh clients:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+---
+
+## 15. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -720,8 +851,12 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 | `Dograh rejected the API key (HTTP 401)` | Key was created in a different Dograh deployment than `DOGRAH_BASE_URL`, or it was archived. |
 | `Dograh agent N does not exist` | Wrong `agent_id` in services.yaml (see the ID column on Dograh's *Voice Agents* page). |
 | Startup warning `has unpublished changes` | The agent has edits saved as a draft. Calls use the last **published** version — publish the agent in Dograh. |
-| Every lead is `not_interested` | Service descriptions too narrow, threshold too high, or leads lack descriptive fields. Check the `prob_*` columns in the results. |
-| Many `decision_error` rows | Gemini rate limit or network issue; lower `DECISION_CONCURRENCY`. Failed leads are saved for retry (`decision_retry_*`). |
+| Intermittent `SSL: CERTIFICATE_VERIFY_FAILED` / `Hostname mismatch` from `https://ai-sdr.grobots.ai` | Stale nginx workers on the scraper server still serving another site's certificate. Fix on the scraper server with `sudo nginx -t && sudo systemctl restart nginx` (see [GO_LIVE.md](GO_LIVE.md#if-pull_leadspy---check-fails)). |
+| `Tracker is locked` / `TrackerLockedError` | Another live pipeline run or `BatchRunner` job is already using `output/pipeline_tracker.xlsx` (`.pipeline_tracker.lock`). Wait for it to finish or stop it cleanly. |
+| `HTTP 409` on `POST /api/runner/start` | A batch run is already active in the dashboard; monitor it or click **Stop** first. |
+| Dashboard returns `400 This address is not allowed.` | Loopback-bound server (`DASHBOARD_HOST=127.0.0.1`) received a non-loopback `Host` header (DNS rebinding protection). Access via `http://127.0.0.1:8090` or `http://localhost:8090`, or bind explicitly with `--host`. |
+| Every lead is `not_interested` | Service descriptions too narrow, threshold too high, or leads lack descriptive fields. Check the `prob_*` columns in the results or **Decision Maker** view in the dashboard. |
+| Many `decision_error` rows | Gemini rate limit or network issue; lower `DECISION_CONCURRENCY`. Failed leads are saved for retry (`*.pending.json` or `decision_retry_*.json`). |
 | `FAILED to start '<service>_<date>'` | Dograh refused the campaign; the message says why (telephony not configured, quota, invalid CSV, ...). |
 | Leads marked `skipped_missing_data` | The agent's prompt uses a `{{variable}}` those leads have no value for. Add the field to the leads, give the variable a default in the prompt (`{{company | there}}`), or remove it. |
 | Calls stay on "Calling…" for a long time | Normal while the conversation lasts. If calls never finish, Dograh is not receiving the telephony provider's status callbacks — check the deployment's public backend URL. Unfinished dialed leads end as `call_timeout` (and undialed leads as `call_failed`) after `CAMPAIGN_IDLE_TIMEOUT_SECONDS` without progress. |
@@ -732,12 +867,12 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 ---
 
-## 14. Limitations and known behaviour
+## 16. Limitations and known behaviour
 
 - **In-memory queues.** In-flight queues are not persisted across crashes, though
-  already-written results are saved atomically to the spreadsheet and cross-run
-  repeat calls are blocked when `SKIP_ALREADY_CALLED=true` (reading `call_results.xlsx`
-  and any timestamped fallback copies). Within a single run, `self._seen` also prevents
+  already-written results are saved atomically to the spreadsheets and cross-run
+  repeat calls are blocked when `SKIP_ALREADY_CALLED=true` (reading `call_results.xlsx`,
+  timestamped fallback copies, and `pipeline_tracker.xlsx`). Within a single run, `self._seen` also prevents
   calling or re-scoring the same number twice.
 - **Campaigns are created after scoring.** Dograh can't add numbers to an
   existing campaign, so campaigns are created when the input ends (or on
@@ -754,7 +889,7 @@ await job.monitor(client, on_call_started, on_result)  # callbacks per call / fi
 
 ---
 
-## 15. Compliance
+## 17. Compliance
 
 AI-generated-voice calls to US numbers are governed by the TCPA: calls to mobile
 numbers generally require prior express consent (written consent for

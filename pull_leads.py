@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pull leads from the lead streamer one batch at a time.
+Pull leads from the lead streamer reverse proxy one batch at a time.
 
-    python main.py        automatic: runs the configured file, then keeps pulling batches
-    python pull_leads.py  manual: a person presses Enter before every next ping
+    python dashboard_server.py  dashboard: starts idle; click Start Batch to pull & call
+    python pull_leads.py        CLI: waits for you to press Enter before every ping (including the first)
 
     1. ping   GET https://ai-sdr.grobots.ai/leads/next   (Authorization: Bearer <token>)
     2. get    one batch of up to 300 lead dicts
@@ -13,9 +13,11 @@ Pull leads from the lead streamer one batch at a time.
               campaigns -> every call finished -> output/call_results.xlsx
     5. wait   for a person: Enter = ping for the next batch, q = quit
 
-In manual mode every next ping needs a human to press Enter. In automatic mode
-(Puller.run_auto) it first confirms the real streamer answers /health, then
-pings, finishes each batch completely, and checks again on a timer.
+In CLI mode (`python pull_leads.py`), every ping — including the first — requires a
+human to press Enter. In the dashboard (`python dashboard_server.py`), the runner stays
+idle until you click Start Batch. In unattended automatic mode (Puller.run_auto, used
+only when explicitly enabled), it first confirms the real streamer answers /health,
+then pings, finishes each batch completely, and checks again on a timer.
 
 Settings (.env): LEAD_SOURCE_URL (default https://ai-sdr.grobots.ai),
 LEAD_SOURCE_TOKEN (= the streamer's STREAM_TOKEN), LEAD_BATCH_SIZE (300).
@@ -272,6 +274,8 @@ def streamer_is_ready(base_url: str, timeout: float = 20) -> bool:
 
 def preflight(need_streamer: bool = True) -> Optional[str]:
     """Check the keys before taking leads from the streamer. Returns a problem, or None."""
+    if need_streamer and not config.LEAD_SOURCE_URL:
+        return "LEAD_SOURCE_URL is missing in .env (the lead streamer reverse proxy URL)."
     if need_streamer and not config.LEAD_SOURCE_TOKEN:
         return "LEAD_SOURCE_TOKEN is missing in .env (the streamer's STREAM_TOKEN)."
     if not config.GEMINI_API_KEY:
@@ -314,16 +318,16 @@ class Puller:
         timeout: float,
         store: BatchStore,
         process: Callable[[List[Dict[str, Any]]], Counter],
-        ask_fn: Callable[[str], str] = ask,
-        ping_fn: Callable[..., PingResult] = ping,
+        ask_fn: Optional[Callable[[str], str]] = None,
+        ping_fn: Optional[Callable[..., PingResult]] = None,
     ):
         self.source_url = source_url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.store = store
         self.process = process
-        self.ask = ask_fn
-        self.ping = ping_fn
+        self.ask = ask_fn if ask_fn is not None else ask
+        self.ping = ping_fn if ping_fn is not None else ping
         self.batches_done = 0
         self.leads_done = 0
         self.last_stats: Any = {}
@@ -351,11 +355,14 @@ class Puller:
                 say(f"The batch is kept in {path}.")
                 if auto:
                     return "failed"
-                answer = self.ask("Enter = try this batch again, l = leave it for later, q = quit: ")
-                if answer == "q":
-                    return "quit"
-                if answer == "l":
-                    return "later"
+                while True:
+                    answer = self.ask("Enter = try this batch again, l = leave it for later, q = quit: ")
+                    if answer in ("q", "quit", "exit", "n", "no"):
+                        return "quit"
+                    if answer == "l":
+                        return "later"
+                    if answer == "":
+                        break
                 continue
             done = self.store.mark_done(path)
             self.batches_done += 1
@@ -363,7 +370,7 @@ class Puller:
             say(f"Batch fully processed ({len(leads)} lead(s)) -> {done.name}")
             return "done"
 
-    def run(self) -> int:
+    def run(self, *, confirm_first: bool = False) -> int:
         # 1. Batches received earlier but not fully processed (crash, Ctrl+C, error)
         for path in self.store.unfinished():
             try:
@@ -371,23 +378,30 @@ class Puller:
             except (OSError, ValueError) as e:
                 say(f"WARNING: cannot read {path.name} ({e}); leaving it alone")
                 continue
-            answer = self.ask(f"Unfinished batch from an earlier run: {path.name} ({n} lead(s)).\n"
-                              "Enter = process it now, l = leave it for later, q = quit: ")
-            if answer == "q":
-                return self._bye(0)
+            while True:
+                answer = self.ask(f"Unfinished batch from an earlier run: {path.name} ({n} lead(s)).\n"
+                                  "Enter = process it now, l = leave it for later, q = quit: ")
+                if answer in ("q", "quit", "exit", "n", "no"):
+                    return self._bye(0)
+                if answer in ("l", ""):
+                    break
             if answer == "l":
                 continue
             if self._run_batch(path) == "quit":
                 return self._bye(130)
 
         # 2. Ping -> process -> wait for a person -> ping ...
-        first = True
+        # When confirm_first=True (CLI startup), require explicit confirmation before the first ping too.
+        first = not confirm_first
         while True:
             if not first:
-                answer = self.ask(f"\nPress Enter to ping the sender for the next batch "
-                                  f"(up to {config.LEAD_BATCH_SIZE} leads), or type q to quit: ")
-                if answer == "q":
-                    return self._bye(0)
+                while True:
+                    answer = self.ask(f"\nPress Enter to ping {self.source_url} for the next batch "
+                                      f"(up to {config.LEAD_BATCH_SIZE} leads), or type q to quit: ")
+                    if answer in ("q", "quit", "exit", "n", "no"):
+                        return self._bye(0)
+                    if answer == "":
+                        break
             first = False
 
             say(f"Pinging {self.source_url}/leads/next ...")
@@ -609,8 +623,8 @@ def check_setup(source_url: str) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Ping the lead streamer for one batch at a time, process it fully, then wait "
-                    "for you to press Enter before the next ping.")
+        description="Wait for you to press Enter before each ping to the lead streamer reverse proxy, "
+                    "then process one batch at a time.")
     parser.add_argument("--url", help=f"Streamer address (default LEAD_SOURCE_URL = {config.LEAD_SOURCE_URL})")
     parser.add_argument("--threshold", type=float, help=f"Call threshold 0-1 (default {config.INTEREST_THRESHOLD})")
     parser.add_argument("--output", help=f"Results .xlsx (default {config.RESULTS_FILE})")
@@ -646,9 +660,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         store=BatchStore(config.PULLED_BATCHES_DIR),
         process=lambda leads: default_process(leads, args.threshold, args.output),
     )
-    print(f"Lead source: {puller.source_url} | batch size {config.LEAD_BATCH_SIZE} | "
-          "after every batch you decide whether to ping again", flush=True)
-    return puller.run()
+    print(f"Lead source (reverse proxy): {puller.source_url} | batch size {config.LEAD_BATCH_SIZE} | "
+          "idle until you press Enter to pull a batch", flush=True)
+    return puller.run(confirm_first=True)
 
 
 if __name__ == "__main__":

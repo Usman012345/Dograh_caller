@@ -9,6 +9,8 @@ const NUM_BATCHES_PRESETS = [1, 2, 5, 10] as const;
 interface Props {
   defaultBatchSize?: number;
   defaultNumBatches?: number;
+  sourceUrl?: string | null;
+  demo?: boolean;
   onClose: () => void;
   onStarted: (status: RunnerStatus) => void;
 }
@@ -40,6 +42,8 @@ function formatApiError(payload: unknown, fallbackStatus: number): string {
 export const BatchRunnerModal: React.FC<Props> = ({
   defaultBatchSize = 300,
   defaultNumBatches = 1,
+  sourceUrl = null,
+  demo = false,
   onClose,
   onStarted,
 }) => {
@@ -125,7 +129,13 @@ export const BatchRunnerModal: React.FC<Props> = ({
           </span>
           <div className="runner-modal-titles">
             <h2 id="runner-modal-title">Start Lead Batch Run</h2>
-            <p>Pulls batches sequentially, processes each lead, and automatically stops when finished.</p>
+            <p>
+              {demo
+                ? "Demo mode: simulates pulling and processing batches offline without contacting the reverse proxy or Dograh."
+                : sourceUrl
+                  ? `Pulls batches directly from ${sourceUrl}, processes each lead, and automatically stops when finished.`
+                  : "Pulls batches sequentially, processes each lead, and automatically stops when finished."}
+            </p>
           </div>
           <button
             type="button"

@@ -149,9 +149,14 @@ class BatchRunner:
     def _resolved_batches_dir(self) -> Path:
         return self._batches_dir if self._batches_dir is not None else Path(config.PULLED_BATCHES_DIR)
 
+    def _snapshot_locked(self) -> Dict[str, Any]:
+        snapshot = dict(self._status)
+        snapshot["source_url"] = None if self.demo else self._resolved_source_url()
+        return snapshot
+
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._status)
+            return self._snapshot_locked()
 
     def start(self, batch_size: int = 300, num_batches: int = 1) -> Dict[str, Any]:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not (1 <= batch_size <= 1000):
@@ -188,7 +193,7 @@ class BatchRunner:
                 name="batch-runner",
             )
             self._thread = thread
-            snapshot = dict(self._status)
+            snapshot = self._snapshot_locked()
 
         thread.start()
         return snapshot
@@ -199,7 +204,7 @@ class BatchRunner:
             if self._status["active"]:
                 self._status["state"] = "stopping"
                 self._status["message"] = "Stopping after current step..."
-            return dict(self._status)
+            return self._snapshot_locked()
 
     def close(self) -> None:
         with self._lock:
@@ -284,6 +289,10 @@ class BatchRunner:
                 return
 
         source_url = self._resolved_source_url()
+        if not source_url:
+            msg = "LEAD_SOURCE_URL is missing in .env (the reverse proxy URL)."
+            self._finish("error", msg, error=msg)
+            return
         token = self._resolved_token()
         timeout = self._resolved_timeout()
         batches_dir = self._resolved_batches_dir()
@@ -334,7 +343,7 @@ class BatchRunner:
                 self._update(
                     current_batch=b,
                     current_batch_leads=0,
-                    message=f"Pulling batch {b} of {num_batches} (up to {batch_size} leads)...",
+                    message=f"Pulling batch {b} of {num_batches} from {source_url} (up to {batch_size} leads)...",
                 )
                 result = _call_ping(ping_fn, source_url, token, timeout, batch_size)
                 if result.kind in (FATAL, RETRY):
